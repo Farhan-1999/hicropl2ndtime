@@ -1,0 +1,33 @@
+# configs/datasets/lulc_seg.yaml
+#
+# LULC semantic segmentation dataset (6 classes) for your layout:
+#   data/bing_rgb/
+#     train/images/*.png
+#     train/masks/*.png
+#     val/images/*.png
+#     val/masks/*.png
+#     metadata.json
+#
+# Notes:
+# - In our current implementation, trainers/hicropl_seg.py directly instantiates LULCSegDataset,
+#   but it still reads cfg.DATASET.* for a few options (ROOT, MASK_SUFFIX, IGNORE_INDEX, etc.).
+# - Set DATASET.ROOT via CLI --root if you prefer; otherwise put the path here.
+
+DATASET:
+  NAME: "LULCSegDataset"            # (optional; used only if you call build_dataset; safe to keep)
+  ROOT: "data/bing_rgb"      # or leave empty and pass --root /path/to/data/bing_rgb
+  NUM_CLASSES: 6
+  CLASSNAMES: ["Unrecognized", "Farmland", "Water", "Forest", "Built-Up", "Meadow"]
+
+  # Mask handling
+  # If your masks are named exactly like images (patch_00000.png), keep "_gt" but it's unused.
+  # If your masks are patch_00000_gt.png, keep "_gt".
+  MASK_SUFFIX: "_gt"
+
+  # If you do not have an ignore label, you can set IGNORE_INDEX to -1
+  # and ensure your loss call does not use ignore_index, or keep 255 and ensure masks never contain 255.
+  IGNORE_INDEX: 255
+
+  # Optional sanity checks / debugging
+  VALIDATE_LABELS: False
+  RETURN_RAW_META: False

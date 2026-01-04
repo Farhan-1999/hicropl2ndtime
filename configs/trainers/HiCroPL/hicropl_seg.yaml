@@ -1,0 +1,75 @@
+# configs/trainers/HiCroPL/hicropl_seg.yaml
+#
+# HiCroPL semantic segmentation config (CLIP semantics + prompt learning + DeepLabV3 head inline in trainer)
+#
+# This is meant to work with:
+#   - trainers/hicropl_seg.py   (TRAINER.NAME = HiCroPL_Seg)
+#   - datasets/lulc_seg.py
+#   - dassl/data/transforms/seg_transforms.py
+#
+# IMPORTANT:
+# - For segmentation you usually want larger crops than 224. Start with 384 or 448 if VRAM allows.
+# - ViT-B/16 requires sizes divisible by 16 for clean token grid.
+
+DATALOADER:
+  TRAIN_X:
+    BATCH_SIZE: 15          # adjust to your GPU (segmentation is heavier than classification)
+  TEST:
+    BATCH_SIZE: 4
+  NUM_WORKERS: 4
+
+INPUT:
+  # For train: we will use random_resized_crop to this crop size
+  SIZE: (224, 224)         # used as default target size
+  CROP_SIZE: (224, 224)    # explicit crop size for seg_transforms
+  INTERPOLATION: "bicubic"
+  PIXEL_MEAN: [0.48145466, 0.4578275, 0.40821073]
+  PIXEL_STD:  [0.26862954, 0.26130258, 0.27577711]
+
+  # Optional multi-scale range for "random_resize" if you add it; otherwise ignored
+  # SCALE_RANGE: (0.5, 2.0)
+
+  # Paired seg transform keywords (handled by build_seg_transform)
+  TRANSFORMS: ["random_resized_crop", "random_flip", "normalize"]
+
+OPTIM:
+  NAME: "adam"
+  LR: 0.0001               # seg tends to need smaller LR than cls; tune
+  MAX_EPOCH: 80
+  LR_SCHEDULER: "cosine"
+  WARMUP_EPOCH: 1
+  WARMUP_TYPE: "constant"
+  WARMUP_CONS_LR: 1e-5
+  EPS: 1e-3
+  WEIGHT_DECAY: 0.0
+
+TRAIN:
+  PRINT_FREQ: 20
+  CHECKPOINT_FREQ: 10
+
+TEST:
+  NO_TEST: False
+  FINAL_MODEL: "best_val"  # use val mIoU to select best
+
+MODEL:
+  BACKBONE:
+    NAME: "ViT-B/16"
+
+TRAINER:
+  NAME: "HiCroPL_Seg"
+
+  # Original HiCroPL hyperparameters (kept intact)
+  HICROPL:
+    N_CTX: 16
+    CROSS_LAYER: 6
+    CTX_INIT: "a photo of a"
+    PREC: "amp"           # "fp16" | "fp32" | "amp"
+    PROMPT_DEPTH: 12
+    TEACHER_NAME: "ViT-B/16"
+    LAMBD: 12.0
+
+  # Segmentation-specific knobs used by trainers/hicropl_seg.py (optional)
+  HICROPL_SEG:
+    PATCH_SIZE: 16         # ViT-B/16
+    ASPP_CHANNELS: 256
+    ATROUS_RATES: (6, 12, 18)
