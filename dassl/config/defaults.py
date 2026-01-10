@@ -161,13 +161,14 @@ _C.MODEL.HEAD.DROPOUT = 0.0
 ###########################
 _C.OPTIM = CN()
 _C.OPTIM.NAME = "adam"
-_C.OPTIM.LR = 0.0003
+_C.OPTIM.LR = 0.0005
 _C.OPTIM.WEIGHT_DECAY = 5e-4
 _C.OPTIM.MOMENTUM = 0.9
 _C.OPTIM.SGD_DAMPNING = 0
 _C.OPTIM.SGD_NESTEROV = False
 _C.OPTIM.RMSPROP_ALPHA = 0.99
 _C.OPTIM.EPS = 1e-8
+_C.OPTIM.PROMPT_LR_MULT = 10.0
 # The following also apply to other
 # adaptive optimizers like adamw
 _C.OPTIM.ADAM_BETA1 = 0.9

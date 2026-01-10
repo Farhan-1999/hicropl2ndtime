@@ -41,7 +41,7 @@ from datasets.lulc_seg import LULCSegDataset, CLASSNAMES_LULC_6
 
 # Reuse HiCroPL core components exactly (keeps hierarchical transfer + LKP intact)
 from .hicropl import load_clip_to_cpu, CrossModalPromptLearner, TextEncoder
-
+import wandb
 
 # -------------------------
 # DeepLabV3-style decoder
@@ -434,9 +434,83 @@ class HiCroPL_Seg(TrainerX):
 
         self.model.to(self.device)
 
-        self.optim = build_optimizer(self.model, cfg.OPTIM)
+        # ----------------------------
+        # Optimizer with prompt-only LR
+        # ----------------------------
+        base_lr = float(cfg.OPTIM.LR)
+        mult = float(getattr(cfg.OPTIM, "PROMPT_LR_MULT", 1.0))
+        prompt_lr = base_lr * mult
+
+        prompt_params = []
+        other_params = []
+
+        def _is_prompt_vector(name: str, p: torch.nn.Parameter) -> bool:
+            # "prompt vectors only" heuristic:
+            # - must be inside prompt_learner
+            # - name contains ctx/prompt
+            # - tensor has >=2 dims (vectors/tables), avoids tiny scalars/biases
+            if "prompt_learner" not in name:
+                return False
+            if not any(k in name for k in ["ctx", "prompt"]):
+                return False
+            return p.ndim >= 2
+
+        for n, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if _is_prompt_vector(n, p):
+                prompt_params.append(p)
+            else:
+                other_params.append(p)
+
+        print(f"[OPT] base_lr={base_lr} prompt_lr={prompt_lr} (x{mult})")
+        print(f"[OPT] prompt_params={len(prompt_params)} other_params={len(other_params)}")
+
+        # Build optimizer manually (keeps your cfg knobs)
+        optim_name = cfg.OPTIM.NAME.lower()
+        wd = float(cfg.OPTIM.WEIGHT_DECAY)
+        eps = float(cfg.OPTIM.EPS)
+
+        param_groups = [
+            {"params": other_params, "lr": base_lr, "weight_decay": wd},
+            {"params": prompt_params, "lr": prompt_lr, "weight_decay": wd},
+        ]
+
+        if optim_name == "adam":
+            betas = (float(cfg.OPTIM.ADAM_BETA1), float(cfg.OPTIM.ADAM_BETA2))
+            self.optim = torch.optim.Adam(param_groups, lr=base_lr, betas=betas, eps=eps, weight_decay=wd)
+
+        elif optim_name == "adamw":
+            betas = (float(cfg.OPTIM.ADAM_BETA1), float(cfg.OPTIM.ADAM_BETA2))
+            self.optim = torch.optim.AdamW(param_groups, lr=base_lr, betas=betas, eps=eps, weight_decay=wd)
+
+        elif optim_name == "sgd":
+            self.optim = torch.optim.SGD(
+                param_groups,
+                lr=base_lr,
+                momentum=float(cfg.OPTIM.MOMENTUM),
+                dampening=float(cfg.OPTIM.SGD_DAMPNING),
+                nesterov=bool(cfg.OPTIM.SGD_NESTEROV),
+                weight_decay=wd,
+            )
+
+        elif optim_name == "rmsprop":
+            self.optim = torch.optim.RMSprop(
+                param_groups,
+                lr=base_lr,
+                momentum=float(cfg.OPTIM.MOMENTUM),
+                alpha=float(cfg.OPTIM.RMSPROP_ALPHA),
+                eps=eps,
+                weight_decay=wd,
+            )
+
+        else:
+            raise ValueError(f"Unsupported optimizer: {cfg.OPTIM.NAME}")
+
+        # Scheduler will preserve group-wise ratios automatically
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("HiCroPL_Seg", self.model, self.optim, self.sched)
+
 
         self.scaler = GradScaler() if cfg.TRAINER.HICROPL.PREC == "amp" else None
 
@@ -446,6 +520,24 @@ class HiCroPL_Seg(TrainerX):
         if device_count > 1:
             print(f"Multiple GPUs detected (n_gpus={device_count}), using DataParallel")
             self.model = nn.DataParallel(self.model)
+
+        self._wandb_on = (wandb is not None) and (os.environ.get("WANDB_MODE", "").lower() != "disabled")
+        self._wandb_run = None
+        if self._wandb_on and (wandb.run is None):
+            self._wandb_run = wandb.init(
+                project=os.environ.get("WANDB_PROJECT", "HiCroPLSeg"),
+                name=os.environ.get("WANDB_RUN_NAME", osp.basename(self.output_dir)),
+                config=self.cfg,
+                dir=self.output_dir,
+            )
+        else:
+            self._wandb_run = wandb.run if (wandb is not None) else None
+
+        # train-epoch accumulators
+        self._train_cm = None
+        self._train_loss_sum = 0.0
+        self._train_loss_count = 0
+        self._last_eval_stats = {}  # e.g., {"val": {...}, "test": {...}}
 
     @torch.no_grad()
     def _get_prompt_learner(self):
@@ -549,26 +641,74 @@ class HiCroPL_Seg(TrainerX):
         img, mask, meta_num = self.parse_batch_train(batch_x)
 
         prec = self.cfg.TRAINER.HICROPL.PREC
-        ignore_index = getattr(self.cfg.DATASET, "IGNORE_INDEX", 255)
+        ignore_index = int(getattr(self.cfg.DATASET, "IGNORE_INDEX", 255))
+
+        # Count valid pixels (not ignore_index)
+        valid = mask.ne(ignore_index)
+        n_valid = int(valid.sum().item())
+
+        # If the whole crop is ignore pixels, skip the update to avoid NaN loss
+        if n_valid == 0:
+            loss_summary = {"loss": 0.0}
+            if self.batch_idx % self.cfg.TRAIN.PRINT_FREQ == 0:
+                self.write_scalar(
+                    "train/loss",
+                    0.0,
+                    self.epoch * self.num_batches + self.batch_idx
+                )
+            return loss_summary
 
         self.optim.zero_grad(set_to_none=True)
 
         if prec == "amp":
+            # Forward under autocast for speed/memory
             with autocast():
                 logits = self.model(img, meta_num=meta_num)  # [B,C,H,W]
-                loss = F.cross_entropy(logits, mask, ignore_index=int(ignore_index))
+
+            # Compute CE safely in fp32 and normalize by number of valid pixels
+            loss_sum = F.cross_entropy(
+                logits.float(),
+                mask,
+                ignore_index=ignore_index,
+                reduction="sum",
+            )
+            loss = loss_sum / float(n_valid)
+
+            # Guard: if loss becomes NaN/Inf, skip the step
+            if not torch.isfinite(loss):
+                loss_summary = {"loss": float("nan")}
+                return loss_summary
+
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optim)
             self.scaler.update()
+
         else:
             logits = self.model(img, meta_num=meta_num)
-            loss = F.cross_entropy(logits, mask, ignore_index=int(ignore_index))
+            loss_sum = F.cross_entropy(
+                logits.float(),
+                mask,
+                ignore_index=ignore_index,
+                reduction="sum",
+            )
+            loss = loss_sum / float(n_valid)
+
+            if not torch.isfinite(loss):
+                loss_summary = {"loss": float("nan")}
+                return loss_summary
+
             loss.backward()
             self.optim.step()
 
-        loss_summary = {"loss": loss.item()}
+        loss_value = float(loss.item())
+        loss_summary = {"loss": loss_value}
+
         if self.batch_idx % self.cfg.TRAIN.PRINT_FREQ == 0:
-            self.write_scalar("train/loss", loss.item(), self.epoch * self.num_batches + self.batch_idx)
+            self.write_scalar(
+                "train/loss",
+                loss_value,
+                self.epoch * self.num_batches + self.batch_idx
+            )
 
         return loss_summary
 
@@ -598,13 +738,15 @@ class HiCroPL_Seg(TrainerX):
         if meet_checkpoint_freq or last_epoch:
             self.save_model(self.epoch, self.output_dir)
 
+  
+
         self._log_and_dump_prompts()
         
     @torch.no_grad()
     def test(self, split: Optional[str] = None) -> float:
         """
         Computes mIoU on val/test and returns it as the main score.
-        Also logs per-class IoU.
+        Also logs per-class IoU and a numerically safe val/test loss.
         """
         self.set_model_mode("eval")
 
@@ -617,9 +759,16 @@ class HiCroPL_Seg(TrainerX):
             loader = self.test_loader
 
         num_classes = self.num_classes
-        ignore_index = getattr(self.cfg.DATASET, "IGNORE_INDEX", 255)
+        ignore_index = int(getattr(self.cfg.DATASET, "IGNORE_INDEX", 255))
 
+        # Confusion matrix for mIoU
         cm = torch.zeros((num_classes, num_classes), dtype=torch.int64, device="cpu")
+
+        # Safe loss accumulation (pixel-weighted)
+        total_loss_sum = 0.0     # sum of CE over valid pixels
+        total_valid_px = 0       # number of valid pixels
+        skipped_batches = 0
+        nonfinite_batches = 0
 
         for batch in loader:
             img, mask, meta_num = self.parse_batch_test(batch)
@@ -627,22 +776,70 @@ class HiCroPL_Seg(TrainerX):
             prec = self.cfg.TRAINER.HICROPL.PREC
             if prec == "amp":
                 with autocast():
-                    logits = self.model(img, meta_num=meta_num)
+                    logits = self.model(img, meta_num=meta_num)  # [B,C,H,W]
             else:
                 logits = self.model(img, meta_num=meta_num)
 
-            pred = torch.argmax(logits, dim=1)  # [B,H,W]
-            cm += _confusion_matrix(pred.detach().cpu(), mask.detach().cpu(), num_classes, ignore_index=int(ignore_index))
+            # If logits contain NaN/Inf, sanitize to avoid NaN loss logging
+            if not torch.isfinite(logits).all():
+                nonfinite_batches += 1
+                logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
 
+            # mIoU confusion matrix update (CPU)
+            pred = torch.argmax(logits, dim=1)  # [B,H,W]
+            cm += _confusion_matrix(
+                pred.detach().cpu(),
+                mask.detach().cpu(),
+                num_classes,
+                ignore_index=ignore_index
+            )
+
+            # Safe loss: skip if this batch has 0 valid pixels
+            valid = mask.ne(ignore_index)
+            n_valid = int(valid.sum().item())
+
+            if n_valid == 0:
+                skipped_batches += 1
+                continue
+
+            loss_sum = F.cross_entropy(
+                logits.float(),          # compute CE in fp32 for stability
+                mask,
+                ignore_index=ignore_index,
+                reduction="sum",         # sum over valid pixels (never 0/0)
+            )
+
+            total_loss_sum += float(loss_sum.item())
+            total_valid_px += n_valid
+
+        # Compute IoU
         miou, per_iou = _miou_from_cm(cm)
 
-        # Logging
-        self.write_scalar(f"{split}/mIoU", miou, self.epoch)
+        # Safe average loss
+        avg_loss = (total_loss_sum / float(total_valid_px)) if total_valid_px > 0 else 0.0
+
+        # Logging (tensorboard)
+        self.write_scalar(f"{split}/loss", float(avg_loss), self.epoch)
+        self.write_scalar(f"{split}/mIoU", float(miou), self.epoch)
         for i, cname in enumerate(self.classnames):
             self.write_scalar(f"{split}/IoU_{cname}", float(per_iou[i].item()), self.epoch)
 
+        # Console prints
+        print(f"[{split}] val_loss: {avg_loss:.4f} (valid_px={total_valid_px}, skipped_batches={skipped_batches}, nonfinite_batches={nonfinite_batches})")
         print(f"[{split}] mIoU: {miou:.4f}")
         for i, cname in enumerate(self.classnames):
             print(f"  - IoU[{i:02d}] {cname}: {float(per_iou[i].item()):.4f}")
 
-        return miou
+        # wandb logging (fixes the old IoU[i] bug by using per_iou)
+        if wandb.run is not None:
+            log_dict = {
+                f"{split}/loss": float(avg_loss),
+                f"{split}/mIoU": float(miou),
+                "epoch": self.epoch + 1,
+            }
+            for i in range(num_classes):
+                log_dict[f"{split}/IoU_class_{i}"] = float(per_iou[i].item())
+            wandb.log(log_dict)
+
+        return float(miou)
+
