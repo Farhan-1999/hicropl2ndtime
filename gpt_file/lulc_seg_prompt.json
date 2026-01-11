@@ -1,45 +1,20 @@
 {
-    "Unrecognized": [
-      "a satellite image patch with unrecognized land cover",
-      "a remote sensing image patch with unclear land cover type",
-      "an aerial image patch of mixed or unknown land cover",
-      "a satellite view of land cover that cannot be confidently categorized",
-      "a remote sensing patch with ambiguous terrain appearance"
-    ],
-    "Farmland": [
-      "a satellite image patch of farmland",
-      "a remote sensing image of agricultural fields",
-      "an aerial image showing crop fields and cultivated land",
-      "a satellite view of planted fields and farm plots",
-      "a remote sensing patch with farmland patterns and field boundaries"
-    ],
-    "Water": [
-      "a satellite image patch of water",
-      "a remote sensing image of river or lake water",
-      "an aerial image showing water bodies and waterways",
-      "a satellite view of a river, canal, or pond",
-      "a remote sensing patch dominated by water surface"
-    ],
-    "Forest": [
-      "a satellite image patch of forest",
-      "a remote sensing image of dense tree cover",
-      "an aerial image showing forest canopy",
-      "a satellite view of woodland with continuous vegetation cover",
-      "a remote sensing patch with dark green forest texture"
-    ],
-    "Built-Up": [
-      "a satellite image patch of built-up area",
-      "a remote sensing image of urban structures and roads",
-      "an aerial image showing buildings, streets, and residential areas",
-      "a satellite view of dense urban development",
-      "a remote sensing patch with man-made structures and paved surfaces"
-    ],
-    "Meadow": [
-      "a satellite image patch of meadow",
-      "a remote sensing image of grassland",
-      "an aerial image showing open green vegetation and meadow",
-      "a satellite view of open grassy land with sparse trees",
-      "a remote sensing patch of natural vegetation and meadow-like fields"
-    ]
-  }
-  
+  "Unrecognized": [
+    "Other/unknown land cover not belonging to the defined classes; unclear or mixed regions."
+  ],
+  "Farmland": [
+    "The segment that is used for farming. It also includes Farmland after crop harvesting and new crop plantation."
+  ],
+  "Water": [
+    "Natural water bodies including rivers, ponds, lakes, and marshlands; may contain mixed vegetation or farmland, provided surface water is the dominant feature."
+  ],
+  "Forest": [
+    "Segment with single trees, a bunch of trees, small bushes, small forest, big forest."
+  ],
+  "Built-Up": [
+    "Man-made structures and infrastructure in urban or rural areas, including buildings, roads, brick factories, and associated paths; minor vegetation may be present if construction dominates."
+  ],
+  "Meadow": [
+    "Grassland or any field free of Farmland. Non-concrete rural paths are also annotated as meadow as they have soil textures."
+  ]
+}

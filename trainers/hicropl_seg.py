@@ -633,6 +633,61 @@ class HiCroPL_Seg(TrainerX):
     def parse_batch_test(self, batch) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         return self.parse_batch_train(batch)
 
+    @torch.no_grad()
+    def _sliding_window_logits(
+        self,
+        img: torch.Tensor,                    # [1,3,H,W]
+        meta_num: Optional[torch.Tensor],     # [1,M] or None
+        tile: int = 224,
+        stride: int = 112,
+    ) -> torch.Tensor:
+        """Run sliding-window inference and stitch logits back to [1,C,H,W]."""
+        assert img.dim() == 4 and img.size(0) == 1, "Pass a single image [1,3,H,W]"
+        device = img.device
+        _, _, H, W = img.shape
+        C = self.num_classes
+
+        # Pad if needed (for small images)
+        pad_h = max(tile - H, 0)
+        pad_w = max(tile - W, 0)
+        if pad_h > 0 or pad_w > 0:
+            img = F.pad(img, (0, pad_w, 0, pad_h), value=0.0)
+
+        Hp, Wp = img.shape[-2], img.shape[-1]
+
+        # Make sure last tile covers the border
+        ys = list(range(0, max(Hp - tile + 1, 1), stride))
+        xs = list(range(0, max(Wp - tile + 1, 1), stride))
+        if ys[-1] != Hp - tile:
+            ys.append(Hp - tile)
+        if xs[-1] != Wp - tile:
+            xs.append(Wp - tile)
+
+        out = torch.zeros((1, C, Hp, Wp), device=device, dtype=torch.float32)
+        cnt = torch.zeros((1, 1, Hp, Wp), device=device, dtype=torch.float32)
+
+        prec = self.cfg.TRAINER.HICROPL.PREC
+
+        for y in ys:
+            for x in xs:
+                patch = img[:, :, y:y + tile, x:x + tile]
+
+                if prec == "amp":
+                    with autocast():
+                        logits_patch = self.model(patch, meta_num=meta_num)
+                else:
+                    logits_patch = self.model(patch, meta_num=meta_num)
+
+                logits_patch = logits_patch.float()
+
+                out[:, :, y:y + tile, x:x + tile] += logits_patch
+                cnt[:, :, y:y + tile, x:x + tile] += 1.0
+
+        out = out / cnt.clamp_min(1.0)
+        out = out[:, :, :H, :W]  # remove padding
+        return out
+
+
     def forward_backward(self, batch_x, batch_u=None):
         """
         TrainerX.run_epoch calls forward_backward(batch_x, batch_u).
@@ -773,12 +828,33 @@ class HiCroPL_Seg(TrainerX):
         for batch in loader:
             img, mask, meta_num = self.parse_batch_test(batch)
 
-            prec = self.cfg.TRAINER.HICROPL.PREC
-            if prec == "amp":
-                with autocast():
-                    logits = self.model(img, meta_num=meta_num)  # [B,C,H,W]
-            else:
-                logits = self.model(img, meta_num=meta_num)
+            tile = int(self.cfg.INPUT.SIZE[0])  # 224
+            stride = tile // 2                 # 112
+
+            logits_list = []
+            B = img.size(0)
+
+            for i in range(B):
+                img_i = img[i:i+1]
+                meta_i = meta_num[i:i+1] if meta_num is not None else None
+
+                # If test images are larger than tile, use sliding window
+                if img_i.size(-1) > tile or img_i.size(-2) > tile:
+                    logits_i = self._sliding_window_logits(img_i, meta_i, tile=tile, stride=stride)
+                else:
+                    prec = self.cfg.TRAINER.HICROPL.PREC
+                    if prec == "amp":
+                        with autocast():
+                            logits_i = self.model(img_i, meta_num=meta_i)
+                    else:
+                        logits_i = self.model(img_i, meta_num=meta_i)
+
+                    logits_i = logits_i.float()
+
+                logits_list.append(logits_i)
+
+            logits = torch.cat(logits_list, dim=0)  # [B,C,H,W]
+
 
             # If logits contain NaN/Inf, sanitize to avoid NaN loss logging
             if not torch.isfinite(logits).all():
