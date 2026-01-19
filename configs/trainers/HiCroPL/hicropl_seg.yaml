@@ -13,18 +13,20 @@
 
 DATALOADER:
   TRAIN_X:
-    BATCH_SIZE: 15         # adjust to your GPU (segmentation is heavier than classification)
+    BATCH_SIZE: 15       # adjust to your GPU (segmentation is heavier than classification)
   TEST:
     BATCH_SIZE: 4
   NUM_WORKERS: 4
 
 INPUT:
   # For train: we will use random_resized_crop to this crop size
-  SIZE: (224, 224)         # used as default target size
-  CROP_SIZE: (224, 224)    # explicit crop size for seg_transforms
+  SIZE: (224, 224)
+  CROP_SIZE: (224, 224)
   INTERPOLATION: "bicubic"
   PIXEL_MEAN: [0.48145466, 0.4578275, 0.40821073]
   PIXEL_STD:  [0.26862954, 0.26130258, 0.27577711]
+  # RRCROP_SCALE: (0.8, 1.0)
+  # RRCROP_RATIO: (0.75, 1.3333333)
 
   # Optional multi-scale range for "random_resize" if you add it; otherwise ignored
   # SCALE_RANGE: (0.5, 2.0)
@@ -42,7 +44,7 @@ OPTIM:
   WARMUP_CONS_LR: 1e-5
   EPS: 1e-3
   WEIGHT_DECAY: 0.0
-  PROMPT_LR_MULT: 10.0
+  PROMPT_LR_MULT: 1.0
 
 TRAIN:
   PRINT_FREQ: 20
@@ -58,7 +60,6 @@ MODEL:
 
 TRAINER:
   NAME: "HiCroPL_Seg"
-
   # Original HiCroPL hyperparameters (kept intact)
   HICROPL:
     N_CTX: 16
@@ -67,10 +68,16 @@ TRAINER:
     PREC: "amp"           # "fp16" | "fp32" | "amp"
     PROMPT_DEPTH: 12
     TEACHER_NAME: "ViT-B/16"
-    LAMBD: 12.0
+    LAMBD: 12.0 
 
   # Segmentation-specific knobs used by trainers/hicropl_seg.py (optional)
   HICROPL_SEG:
     PATCH_SIZE: 16         # ViT-B/16
     ASPP_CHANNELS: 256
     ATROUS_RATES: (1, 2, 4)
+    LOSS: ce_dice
+    CE_WEIGHT: 1.0
+    DICE_WEIGHT: 1.0
+    DICE_EPS: 1e-6
+    # Optional (leave empty for now):
+    CLASS_WEIGHTS: ()  

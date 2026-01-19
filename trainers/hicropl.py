@@ -177,6 +177,9 @@ class CrossModalPromptLearner(nn.Module):
         self.cross_prompts_depth = cfg.TRAINER.HICROPL.PROMPT_DEPTH
         self.cross_layer = cfg.TRAINER.HICROPL.CROSS_LAYER
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
+        # if cfg_imsize != clip_imsize:
+        #     print(f"[WARN] cfg_imsize ({cfg_imsize}) != clip_imsize ({clip_imsize}). "
+        #     f"Proceeding anyway; CLIP ViT will interpolate positional embeddings.")
 
         ######## cross-modal text token initialization ########
         if ctx_init and (n_ctx) <= 4:

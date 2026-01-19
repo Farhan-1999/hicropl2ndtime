@@ -136,7 +136,7 @@ def extend_cfg(cfg):
 
     # Config for HiCroPL
     cfg.TRAINER.HICROPL = CN()
-    cfg.TRAINER.HICROPL.N_CTX = 2 # number of context vectors
+    cfg.TRAINER.HICROPL.N_CTX = 16 # number of context vectors
     cfg.TRAINER.HICROPL.CROSS_LAYER = 6 # cross layer
     cfg.TRAINER.HICROPL.CTX_INIT = "a photo of a" # initialization words (only for language prompts)
     cfg.TRAINER.HICROPL.PREC = "fp16"

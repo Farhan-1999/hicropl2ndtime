@@ -14,8 +14,8 @@
 # - Set DATASET.ROOT via CLI --root if you prefer; otherwise put the path here.
 
 DATASET:
-  NAME: "LULCSegDataset"            # (optional; used only if you call build_dataset; safe to keep)
-  ROOT: "data/bing_rgb"      # or leave empty and pass --root /path/to/data/bing_rgb
+  NAME: "LULCSegDataset" # (optional; used only if you call build_dataset; safe to keep)
+  ROOT: "data/bing_rgb" # or leave empty and pass --root /path/to/data/bing_rgb
   NUM_CLASSES: 6
   CLASSNAMES: ["Unrecognized", "Farmland", "Water", "Forest", "Built-Up", "Meadow"]
 

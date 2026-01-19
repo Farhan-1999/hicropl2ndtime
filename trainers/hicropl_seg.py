@@ -39,6 +39,8 @@ from dassl.data.transforms import build_seg_transform
 
 from datasets.lulc_seg import LULCSegDataset, CLASSNAMES_LULC_6
 
+
+
 # Reuse HiCroPL core components exactly (keeps hierarchical transfer + LKP intact)
 from .hicropl import load_clip_to_cpu, CrossModalPromptLearner, TextEncoder
 import wandb
@@ -265,8 +267,89 @@ class CustomCLIPSeg(nn.Module):
 
 
 # -------------------------
+# Segmentation losses
+# -------------------------
+
+def _soft_dice_loss_from_logits(
+        logits: torch.Tensor,          # [B,C,H,W]
+        target: torch.Tensor,          # [B,H,W]
+        ignore_index: int = 255,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """
+        Soft Dice loss for multi-class segmentation.
+        - Ignores ignore_index pixels
+        - Averages Dice over classes present in GT in this batch (more stable)
+        """
+        logits = logits.float()
+        B, C, H, W = logits.shape
+
+        valid = target.ne(ignore_index)
+        if int(valid.sum().item()) == 0:
+            return logits.new_tensor(0.0)
+
+        # one_hot cannot handle values like 255 -> make a safe target
+        target_safe = target.clone()
+        target_safe[~valid] = 0  # any valid class id is fine here because we mask later
+
+        target_1h = F.one_hot(target_safe, num_classes=C).permute(0, 3, 1, 2).float()  # [B,C,H,W]
+
+        valid_f = valid.unsqueeze(1).float()  # [B,1,H,W]
+        probs = torch.softmax(logits, dim=1) * valid_f
+        target_1h = target_1h * valid_f
+
+        inter = (probs * target_1h).sum(dim=(0, 2, 3))       # [C]
+        p_sum = probs.sum(dim=(0, 2, 3))                     # [C]
+        t_sum = target_1h.sum(dim=(0, 2, 3))                 # [C]
+
+        dice = (2.0 * inter + eps) / (p_sum + t_sum + eps)   # [C]
+
+        present = t_sum > 0
+        if present.any():
+            return 1.0 - dice[present].mean()
+
+        return logits.new_tensor(0.0)
+
+
+def _focal_loss_from_logits(
+    logits: torch.Tensor,          # [B,C,H,W]
+    target: torch.Tensor,          # [B,H,W]
+    ignore_index: int = 255,
+    gamma: float = 2.0,
+    class_weight: Optional[torch.Tensor] = None,  # [C] on same device
+) -> torch.Tensor:
+    """
+    Multi-class focal loss:
+    FL = (1 - pt)^gamma * (-log pt)
+    If class_weight is provided, it multiplies each pixel loss by class_weight[y].
+    """
+    logits = logits.float()
+    B, C, H, W = logits.shape
+
+    target_flat = target.view(-1)                                  # [N]
+    logits_flat = logits.permute(0, 2, 3, 1).reshape(-1, C)        # [N,C]
+
+    valid = target_flat.ne(ignore_index)
+    if int(valid.sum().item()) == 0:
+        return logits.new_tensor(0.0)
+
+    tgt = target_flat[valid]                                       # [Nv]
+    log_probs = F.log_softmax(logits_flat[valid], dim=1)           # [Nv,C]
+    log_pt = log_probs.gather(1, tgt.unsqueeze(1)).squeeze(1)      # [Nv]
+    pt = log_pt.exp()
+
+    loss = ((1.0 - pt) ** float(gamma)) * (-log_pt)                # [Nv]
+
+    if class_weight is not None:
+        loss = loss * class_weight[tgt]
+
+    return loss.mean()
+
+
+# -------------------------
 # Segmentation metrics
 # -------------------------
+
 
 @torch.no_grad()
 def _confusion_matrix(
@@ -433,6 +516,8 @@ class HiCroPL_Seg(TrainerX):
             print(f"  - {n}")
 
         self.model.to(self.device)
+
+        self._init_seg_loss_cfg()
 
         # ----------------------------
         # Optimizer with prompt-only LR
@@ -633,6 +718,101 @@ class HiCroPL_Seg(TrainerX):
     def parse_batch_test(self, batch) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         return self.parse_batch_train(batch)
 
+    def _init_seg_loss_cfg(self):
+        """
+        Reads loss settings from cfg.TRAINER.HICROPL_SEG (with safe defaults).
+        Supported:
+            LOSS: "ce", "ce_dice", "focal", "focal_dice"
+            CE_WEIGHT, DICE_WEIGHT
+            FOCAL_GAMMA
+            CLASS_WEIGHTS (list/tuple length C)  [optional]
+            DICE_EPS
+        """
+        seg_cfg = getattr(self.cfg.TRAINER, "HICROPL_SEG", None)
+
+        self._loss_name = str(getattr(seg_cfg, "LOSS", "ce_dice")).lower()
+        self._loss_ce_w = float(getattr(seg_cfg, "CE_WEIGHT", 1.0))
+        self._loss_dice_w = float(getattr(seg_cfg, "DICE_WEIGHT", 1.0))
+        self._loss_focal_gamma = float(getattr(seg_cfg, "FOCAL_GAMMA", 2.0))
+        self._loss_dice_eps = float(getattr(seg_cfg, "DICE_EPS", 1e-6))
+
+        cw = getattr(seg_cfg, "CLASS_WEIGHTS", None)
+        self._loss_class_weight = None
+        if cw is not None and isinstance(cw, (list, tuple)) and len(cw) > 0:
+            self._loss_class_weight = torch.tensor(list(cw), device=self.device, dtype=torch.float32)
+
+        valid_modes = {"ce", "ce_dice", "focal", "focal_dice"}
+        if self._loss_name not in valid_modes:
+            print(f"[WARN] Unknown HICROPL_SEG.LOSS='{self._loss_name}', falling back to 'ce_dice'")
+            self._loss_name = "ce_dice"
+
+        print(
+            f"[LOSS] mode={self._loss_name} ce_w={self._loss_ce_w} "
+            f"dice_w={self._loss_dice_w} gamma={self._loss_focal_gamma}"
+        )
+
+    def _compute_seg_loss(self, logits: torch.Tensor, mask: torch.Tensor, ignore_index: int):
+        """
+        Returns:
+            total_loss (Tensor scalar),
+            comps (dict of floats for logging)
+        """
+        if not hasattr(self, "_loss_name"):
+            self._init_seg_loss_cfg()
+
+        logits_fp32 = logits.float()
+
+        valid = mask.ne(ignore_index)
+        n_valid = int(valid.sum().item())
+        if n_valid == 0:
+            z = logits_fp32.sum() * 0.0
+            return z, {"total": 0.0, "ce": 0.0, "focal": 0.0, "dice": 0.0}
+
+        # --- CE (pixel-normalized) ---
+        ce_sum = F.cross_entropy(
+            logits_fp32,
+            mask,
+            ignore_index=ignore_index,
+            reduction="sum",
+            weight=self._loss_class_weight,
+        )
+        ce = ce_sum / float(n_valid)
+
+        # --- focal (optional) ---
+        if self._loss_name.startswith("focal"):
+            focal = _focal_loss_from_logits(
+                logits_fp32,
+                mask,
+                ignore_index=ignore_index,
+                gamma=self._loss_focal_gamma,
+                class_weight=self._loss_class_weight,
+            )
+            cls_loss = focal
+        else:
+            focal = logits_fp32.new_tensor(0.0)
+            cls_loss = ce
+
+        # --- dice (optional) ---
+        if self._loss_name.endswith("dice"):
+            dice = _soft_dice_loss_from_logits(
+                logits_fp32,
+                mask,
+                ignore_index=ignore_index,
+                eps=self._loss_dice_eps,
+            )
+        else:
+            dice = logits_fp32.new_tensor(0.0)
+
+        total = self._loss_ce_w * cls_loss + self._loss_dice_w * dice
+
+        comps = {
+            "total": float(total.detach().item()),
+            "ce": float(ce.detach().item()),
+            "focal": float(focal.detach().item()),
+            "dice": float(dice.detach().item()),
+        }
+        return total, comps
+
     @torch.no_grad()
     def _sliding_window_logits(
         self,
@@ -698,41 +878,25 @@ class HiCroPL_Seg(TrainerX):
         prec = self.cfg.TRAINER.HICROPL.PREC
         ignore_index = int(getattr(self.cfg.DATASET, "IGNORE_INDEX", 255))
 
-        # Count valid pixels (not ignore_index)
+        # If the whole crop is ignore pixels, skip update to avoid NaNs
         valid = mask.ne(ignore_index)
         n_valid = int(valid.sum().item())
-
-        # If the whole crop is ignore pixels, skip the update to avoid NaN loss
         if n_valid == 0:
             loss_summary = {"loss": 0.0}
             if self.batch_idx % self.cfg.TRAIN.PRINT_FREQ == 0:
-                self.write_scalar(
-                    "train/loss",
-                    0.0,
-                    self.epoch * self.num_batches + self.batch_idx
-                )
+                self.write_scalar("train/loss", 0.0, self.epoch * self.num_batches + self.batch_idx)
             return loss_summary
 
         self.optim.zero_grad(set_to_none=True)
 
         if prec == "amp":
-            # Forward under autocast for speed/memory
             with autocast():
                 logits = self.model(img, meta_num=meta_num)  # [B,C,H,W]
 
-            # Compute CE safely in fp32 and normalize by number of valid pixels
-            loss_sum = F.cross_entropy(
-                logits.float(),
-                mask,
-                ignore_index=ignore_index,
-                reduction="sum",
-            )
-            loss = loss_sum / float(n_valid)
+            loss, comps = self._compute_seg_loss(logits, mask, ignore_index)
 
-            # Guard: if loss becomes NaN/Inf, skip the step
             if not torch.isfinite(loss):
-                loss_summary = {"loss": float("nan")}
-                return loss_summary
+                return {"loss": float("nan")}
 
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optim)
@@ -740,30 +904,23 @@ class HiCroPL_Seg(TrainerX):
 
         else:
             logits = self.model(img, meta_num=meta_num)
-            loss_sum = F.cross_entropy(
-                logits.float(),
-                mask,
-                ignore_index=ignore_index,
-                reduction="sum",
-            )
-            loss = loss_sum / float(n_valid)
+            loss, comps = self._compute_seg_loss(logits, mask, ignore_index)
 
             if not torch.isfinite(loss):
-                loss_summary = {"loss": float("nan")}
-                return loss_summary
+                return {"loss": float("nan")}
 
             loss.backward()
             self.optim.step()
 
         loss_value = float(loss.item())
-        loss_summary = {"loss": loss_value}
+        loss_summary = {"loss": loss_value, **comps}
 
         if self.batch_idx % self.cfg.TRAIN.PRINT_FREQ == 0:
-            self.write_scalar(
-                "train/loss",
-                loss_value,
-                self.epoch * self.num_batches + self.batch_idx
-            )
+            step = self.epoch * self.num_batches + self.batch_idx
+            self.write_scalar("train/loss", loss_value, step)
+            self.write_scalar("train/loss_ce", float(comps["ce"]), step)
+            self.write_scalar("train/loss_focal", float(comps["focal"]), step)
+            self.write_scalar("train/loss_dice", float(comps["dice"]), step)
 
         return loss_summary
 
