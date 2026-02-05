@@ -80,4 +80,8 @@ TRAINER:
     DICE_WEIGHT: 1.0
     DICE_EPS: 1e-6
     # Optional (leave empty for now):
-    CLASS_WEIGHTS: ()  
+    CLASS_WEIGHTS: ()
+
+    USE_DESC: True
+    DESC_W: 0.1
+    DESC_BANK: "data/bing_rgb/desc_emb_bank.pt"  

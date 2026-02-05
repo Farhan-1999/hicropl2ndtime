@@ -176,6 +176,26 @@ def _extract_patch_tokens(visual_out: Any) -> torch.Tensor:
 
     raise RuntimeError(f"Unsupported visual_out type: {type(visual_out)}")
 
+def _extract_global_feat(visual_out: Any) -> torch.Tensor:
+    """
+    Supports:
+    - tuple/list that contains a [B,D] tensor (e.g., (global, patch_tokens))
+    - dict with key "global"
+    """
+    if isinstance(visual_out, dict):
+        if "global" in visual_out:
+            return visual_out["global"]
+        raise RuntimeError(f"visual_out dict keys={list(visual_out.keys())}, expected 'global'")
+
+    if isinstance(visual_out, (tuple, list)):
+        for x in visual_out:
+            if isinstance(x, torch.Tensor) and x.dim() == 2:
+                return x
+        raise RuntimeError("visual_out tuple/list did not contain a 2D tensor [B,D] for global")
+
+    raise RuntimeError(f"Unsupported visual_out type for global feature: {type(visual_out)}")
+
+
 
 class CustomCLIPSeg(nn.Module):
     """
@@ -218,7 +238,8 @@ class CustomCLIPSeg(nn.Module):
     def forward(
         self,
         image: torch.Tensor,
-    ) -> torch.Tensor:
+        return_global: bool = False,
+    ):
         """
         Returns:
           logits: [B, C, H, W]
@@ -234,7 +255,19 @@ class CustomCLIPSeg(nn.Module):
 
         # Visual forward: must provide patch tokens
         # (Your CLIP visual forward should be extended to return patch tokens.)
-        visual_out = self.image_encoder(image.type(self.dtype), visual_ctx0, cross_prompts_visual_deeper, return_patch_tokens=True)
+        visual_out = self.image_encoder(
+            image.type(self.dtype),
+            visual_ctx0,
+            cross_prompts_visual_deeper,
+            return_patch_tokens=True,
+        )
+
+        global_feat = None
+        if return_global:
+            global_feat = _extract_global_feat(visual_out)  # [B, D_out]
+            global_feat = global_feat.float()
+            global_feat = global_feat / (global_feat.norm(dim=-1, keepdim=True) + 1e-12)
+
         patch_tokens = _extract_patch_tokens(visual_out)  # [B, N or 1+N, D]
 
         # Drop class token if present
@@ -262,6 +295,8 @@ class CustomCLIPSeg(nn.Module):
         # logits: [B, C, H, W]
         logits = logit_scale * torch.einsum("bchw,kc->bkhw", pix_emb, text_features)
 
+        if return_global:
+            return logits, global_feat
         return logits
 
 
@@ -513,6 +548,7 @@ class HiCroPL_Seg(TrainerX):
         self.model.to(self.device)
 
         self._init_seg_loss_cfg()
+        self._init_desc_cfg()
 
         # ----------------------------
         # Optimizer with prompt-only LR
@@ -705,6 +741,40 @@ class HiCroPL_Seg(TrainerX):
     def parse_batch_test(self, batch) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.parse_batch_train(batch)
 
+    def _init_desc_cfg(self):
+        seg_cfg = getattr(self.cfg.TRAINER, "HICROPL_SEG", None)
+
+        self.use_desc = bool(getattr(seg_cfg, "USE_DESC", False)) if seg_cfg is not None else False
+        self.desc_w = float(getattr(seg_cfg, "DESC_W", 0.1)) if seg_cfg is not None else 0.1
+        self.desc_bank_path = str(getattr(seg_cfg, "DESC_BANK", "data/bing_rgb/desc_emb_bank.pt")) if seg_cfg is not None else "data/bing_rgb/desc_emb_bank.pt"
+
+        self.desc_bank = None
+        if not self.use_desc:
+            return
+
+        if not osp.exists(self.desc_bank_path):
+            raise FileNotFoundError(
+                f"[DESC] desc bank not found: {self.desc_bank_path}\n"
+                f"Run: python tools/precompute_desc_emb.py --root data/bing_rgb"
+            )
+
+        bank = torch.load(self.desc_bank_path, map_location="cpu")
+        if not isinstance(bank, dict) or len(bank) == 0:
+            raise RuntimeError(f"[DESC] invalid/empty bank at {self.desc_bank_path}")
+
+        # Ensure float32 CPU, normalized
+        cleaned = {}
+        for k, v in bank.items():
+            if not isinstance(v, torch.Tensor):
+                continue
+            x = v.detach().float().cpu()
+            x = x / (x.norm(dim=-1, keepdim=False) + 1e-12)
+            cleaned[str(k)] = x
+        self.desc_bank = cleaned
+
+        print(f"[DESC] Enabled. Loaded {len(self.desc_bank)} embeddings from {self.desc_bank_path}")
+
+
     def _init_seg_loss_cfg(self):
         """
         Reads loss settings from cfg.TRAINER.HICROPL_SEG (with safe defaults).
@@ -877,9 +947,42 @@ class HiCroPL_Seg(TrainerX):
 
         if prec == "amp":
             with autocast():
-                logits = self.model(img)  # [B,C,H,W]  # [B,C,H,W]
+                if getattr(self, "use_desc", False):
+                    logits, img_global = self.model(img, return_global=True)
+                else:
+                    logits = self.model(img)
 
-            loss, comps = self._compute_seg_loss(logits, mask, ignore_index)
+            loss_seg, comps = self._compute_seg_loss(logits, mask, ignore_index)
+            loss = loss_seg
+
+            # ---- Description alignment (InfoNCE) ----
+            if getattr(self, "use_desc", False) and (self.desc_bank is not None):
+                keys = batch_x.get("key", None)
+                if keys is not None:
+                    keep_idx = []
+                    t_list = []
+                    for i, k in enumerate(keys):
+                        te = self.desc_bank.get(k, None)
+                        if te is not None:
+                            keep_idx.append(i)
+                            t_list.append(te)
+
+                    if len(keep_idx) >= 2:
+                        V = img_global[keep_idx].to(img.device, non_blocking=True)  # [M,D]
+                        T = torch.stack(t_list, dim=0).to(img.device, non_blocking=True)  # [M,D]
+
+                        # Use CLIP logit_scale for temperature (frozen)
+                        m = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+                        scale = m.logit_scale.exp().float()
+
+                        logits_it = scale * (V @ T.t())  # [M,M]
+                        labels = torch.arange(logits_it.size(0), device=img.device)
+
+                        loss_desc = 0.5 * (F.cross_entropy(logits_it, labels) + F.cross_entropy(logits_it.t(), labels))
+                        loss = loss + float(getattr(self, "desc_w", 0.1)) * loss_desc
+                        comps["desc"] = float(loss_desc.item())
+                    else:
+                        comps["desc"] = 0.0
 
             if not torch.isfinite(loss):
                 return {"loss": float("nan")}
@@ -889,12 +992,55 @@ class HiCroPL_Seg(TrainerX):
             self.scaler.update()
 
         else:
-            logits = self.model(img)  # [B,C,H,W]
-            loss, comps = self._compute_seg_loss(logits, mask, ignore_index)
+            # Forward
+            if getattr(self, "use_desc", False):
+                logits, img_global = self.model(img, return_global=True)
+            else:
+                logits = self.model(img)
+
+            # Segmentation loss (unchanged)
+            loss_seg, comps = self._compute_seg_loss(logits, mask, ignore_index)
+            loss = loss_seg
+
+            # ---- Description alignment (InfoNCE) ----
+            if getattr(self, "use_desc", False) and (self.desc_bank is not None):
+                keys = batch_x.get("key", None)
+                if keys is not None:
+                    keep_idx = []
+                    t_list = []
+                    for i, k in enumerate(keys):
+                        te = self.desc_bank.get(k, None)
+                        if te is not None:
+                            keep_idx.append(i)
+                            t_list.append(te)
+
+                    # Need at least 2 samples to form negatives
+                    if len(keep_idx) >= 2:
+                        V = img_global[keep_idx].to(img.device, non_blocking=True)  # [M,D]
+                        T = torch.stack(t_list, dim=0).to(img.device, non_blocking=True)  # [M,D]
+
+                        # Use CLIP logit_scale for temperature scaling
+                        m = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+                        scale = m.logit_scale.exp().float()
+
+                        logits_it = scale * (V @ T.t())  # [M,M]
+                        labels = torch.arange(logits_it.size(0), device=img.device)
+
+                        loss_desc = 0.5 * (
+                            F.cross_entropy(logits_it, labels) +
+                            F.cross_entropy(logits_it.t(), labels)
+                        )
+
+                        loss = loss + float(getattr(self, "desc_w", 0.1)) * loss_desc
+                        comps["desc"] = float(loss_desc.item())
+                    else:
+                        comps["desc"] = 0.0
 
             if not torch.isfinite(loss):
                 return {"loss": float("nan")}
 
+            # Backward + step
+            self.optim.zero_grad(set_to_none=True)
             loss.backward()
             self.optim.step()
 
@@ -907,6 +1053,8 @@ class HiCroPL_Seg(TrainerX):
             self.write_scalar("train/loss_ce", float(comps["ce"]), step)
             self.write_scalar("train/loss_focal", float(comps["focal"]), step)
             self.write_scalar("train/loss_dice", float(comps["dice"]), step)
+            if "desc" in comps:
+                self.write_scalar("train/loss_desc", float(comps["desc"]), step)
 
         return loss_summary
 
