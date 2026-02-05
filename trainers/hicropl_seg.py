@@ -218,7 +218,6 @@ class CustomCLIPSeg(nn.Module):
     def forward(
         self,
         image: torch.Tensor,
-        meta_num: Optional[torch.Tensor] = None,  # kept for later (metadata-conditioned prompts), safe to ignore now
     ) -> torch.Tensor:
         """
         Returns:
@@ -445,21 +444,17 @@ class HiCroPL_Seg(TrainerX):
         train_set = LULCSegDataset(
             root=root_dir,
             split="train",
-            metadata_json="metadata.json",
             transforms=tfm_train,
             mask_suffix=getattr(cfg.DATASET, "MASK_SUFFIX", "_gt"),
             validate_labels=getattr(cfg.DATASET, "VALIDATE_LABELS", False),
-            return_raw_meta=getattr(cfg.DATASET, "RETURN_RAW_META", False),
         )
 
         val_set = LULCSegDataset(
             root=root_dir,
             split="val",
-            metadata_json="metadata.json",
             transforms=tfm_test,
             mask_suffix=getattr(cfg.DATASET, "MASK_SUFFIX", "_gt"),
             validate_labels=False,
-            return_raw_meta=getattr(cfg.DATASET, "RETURN_RAW_META", False),
         )
 
         # Dataloader params
@@ -505,7 +500,7 @@ class HiCroPL_Seg(TrainerX):
         print("Building segmentation model (prompted CLIP + DeepLabV3 head)")
         self.model = CustomCLIPSeg(cfg, classnames, clip_model)
 
-        print("Turning off gradients in the CLIP encoders; training prompts + decoder (and optional meta encoder later)")
+        print("Turning off gradients in the CLIP encoders; training prompts + decoder")
         train_keys = ("prompt_learner", "decoder")
         for name, param in self.model.named_parameters():
             param.requires_grad_(any(k in name for k in train_keys))
@@ -702,20 +697,12 @@ class HiCroPL_Seg(TrainerX):
         self._prev_prompt_snapshot = snap
         
 
-    def parse_batch_train(self, batch) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    def parse_batch_train(self, batch) -> Tuple[torch.Tensor, torch.Tensor]:
         img = batch["img"].to(self.device, non_blocking=True)
         mask = batch["mask"].to(self.device, non_blocking=True).long()
+        return img, mask
 
-        meta_num = None
-        # Default PyTorch collate will collate nested dicts if present for all samples.
-        if "meta" in batch and batch["meta"] is not None:
-            meta = batch["meta"]
-            if isinstance(meta, dict) and "numeric" in meta and meta["numeric"] is not None:
-                meta_num = meta["numeric"].to(self.device, non_blocking=True).float()
-
-        return img, mask, meta_num
-
-    def parse_batch_test(self, batch) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    def parse_batch_test(self, batch) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.parse_batch_train(batch)
 
     def _init_seg_loss_cfg(self):
@@ -816,8 +803,7 @@ class HiCroPL_Seg(TrainerX):
     @torch.no_grad()
     def _sliding_window_logits(
         self,
-        img: torch.Tensor,                    # [1,3,H,W]
-        meta_num: Optional[torch.Tensor],     # [1,M] or None
+        img: torch.Tensor,  # [1,3,H,W]
         tile: int = 224,
         stride: int = 112,
     ) -> torch.Tensor:
@@ -854,9 +840,9 @@ class HiCroPL_Seg(TrainerX):
 
                 if prec == "amp":
                     with autocast():
-                        logits_patch = self.model(patch, meta_num=meta_num)
+                        logits_patch = self.model(patch)
                 else:
-                    logits_patch = self.model(patch, meta_num=meta_num)
+                    logits_patch = self.model(patch)
 
                 logits_patch = logits_patch.float()
 
@@ -873,7 +859,7 @@ class HiCroPL_Seg(TrainerX):
         TrainerX.run_epoch calls forward_backward(batch_x, batch_u).
         We ignore batch_u (fully supervised).
         """
-        img, mask, meta_num = self.parse_batch_train(batch_x)
+        img, mask = self.parse_batch_train(batch_x)
 
         prec = self.cfg.TRAINER.HICROPL.PREC
         ignore_index = int(getattr(self.cfg.DATASET, "IGNORE_INDEX", 255))
@@ -891,7 +877,7 @@ class HiCroPL_Seg(TrainerX):
 
         if prec == "amp":
             with autocast():
-                logits = self.model(img, meta_num=meta_num)  # [B,C,H,W]
+                logits = self.model(img)  # [B,C,H,W]  # [B,C,H,W]
 
             loss, comps = self._compute_seg_loss(logits, mask, ignore_index)
 
@@ -903,7 +889,7 @@ class HiCroPL_Seg(TrainerX):
             self.scaler.update()
 
         else:
-            logits = self.model(img, meta_num=meta_num)
+            logits = self.model(img)  # [B,C,H,W]
             loss, comps = self._compute_seg_loss(logits, mask, ignore_index)
 
             if not torch.isfinite(loss):
@@ -983,7 +969,7 @@ class HiCroPL_Seg(TrainerX):
         nonfinite_batches = 0
 
         for batch in loader:
-            img, mask, meta_num = self.parse_batch_test(batch)
+            img, mask = self.parse_batch_test(batch)
 
             tile = int(self.cfg.INPUT.SIZE[0])  # 224
             stride = tile // 2                 # 112
@@ -993,18 +979,17 @@ class HiCroPL_Seg(TrainerX):
 
             for i in range(B):
                 img_i = img[i:i+1]
-                meta_i = meta_num[i:i+1] if meta_num is not None else None
 
                 # If test images are larger than tile, use sliding window
                 if img_i.size(-1) > tile or img_i.size(-2) > tile:
-                    logits_i = self._sliding_window_logits(img_i, meta_i, tile=tile, stride=stride)
+                    logits_i = self._sliding_window_logits(img_i, tile=tile, stride=stride)
                 else:
                     prec = self.cfg.TRAINER.HICROPL.PREC
                     if prec == "amp":
                         with autocast():
-                            logits_i = self.model(img_i, meta_num=meta_i)
+                            logits_i = self.model(img_i)
                     else:
-                        logits_i = self.model(img_i, meta_num=meta_i)
+                        logits_i = self.model(img_i)
 
                     logits_i = logits_i.float()
 

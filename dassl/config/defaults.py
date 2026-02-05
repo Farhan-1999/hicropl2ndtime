@@ -99,7 +99,6 @@ _C.DATASET.CLASSNAMES = ()
 _C.DATASET.MASK_SUFFIX = "_gt"
 _C.DATASET.IGNORE_INDEX = 255
 _C.DATASET.VALIDATE_LABELS = False
-_C.DATASET.RETURN_RAW_META = False
 
 ###########################
 # Dataloader

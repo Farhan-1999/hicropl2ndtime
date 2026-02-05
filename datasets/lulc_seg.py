@@ -30,8 +30,6 @@ class LULCSample:
     key: str
     img_path: str
     mask_path: str
-    meta_raw: Optional[Dict[str, Any]]
-    meta_num: Optional[torch.Tensor]
 
 
 def _is_image_file(p: Path) -> bool:
@@ -105,7 +103,6 @@ class LULCSegDataset(Dataset):
         val/
           images/
           masks/
-        metadata.json
 
     Masks:
       Supports either:
@@ -117,7 +114,6 @@ class LULCSegDataset(Dataset):
         self,
         root: Union[str, Path] = "data/bing_rgb",
         split: str = "train",
-        metadata_json: Union[str, Path] = "metadata.json",
         # If you want to override the default split dirs:
         images_dir: Optional[Union[str, Path]] = None,
         masks_dir: Optional[Union[str, Path]] = None,
@@ -125,7 +121,6 @@ class LULCSegDataset(Dataset):
         transforms: Optional[Callable[[Image.Image, Image.Image], Tuple[torch.Tensor, torch.Tensor]]] = None,
         mask_suffix: str = "_gt",
         validate_labels: bool = False,
-        return_raw_meta: bool = False,
         max_samples: Optional[int] = None,
     ) -> None:
         super().__init__()
@@ -138,7 +133,6 @@ class LULCSegDataset(Dataset):
         self.num_classes = len(self.classnames)
         self.transforms = transforms
         self.mask_suffix = mask_suffix
-        self.return_raw_meta = return_raw_meta
 
         # Default dirs from your structure
         if images_dir is None:
@@ -158,14 +152,6 @@ class LULCSegDataset(Dataset):
         if not self.masks_dir.exists():
             raise FileNotFoundError(f"Masks dir not found: {self.masks_dir}")
 
-        # Metadata
-        meta_path = Path(metadata_json)
-        meta_path = meta_path.resolve() if meta_path.is_absolute() else (self.root / meta_path).resolve()
-        if not meta_path.exists():
-            raise FileNotFoundError(f"metadata.json not found: {meta_path}")
-
-        with meta_path.open("r", encoding="utf-8") as f:
-            self._metadata = json.load(f)
 
         # Collect image keys
         keys = sorted([p.name for p in self.images_dir.iterdir() if p.is_file() and _is_image_file(p)])
@@ -187,16 +173,11 @@ class LULCSegDataset(Dataset):
                     f"Check your mask filenames or adjust mask_suffix."
                 )
 
-            meta_raw = self._metadata.get(key)
-            meta_num = encode_metadata_numeric(meta_raw) if meta_raw is not None else None
-
             samples.append(
                 LULCSample(
                     key=key,
                     img_path=str(img_path),
                     mask_path=str(mask_path),
-                    meta_raw=meta_raw,
-                    meta_num=meta_num,
                 )
             )
 
@@ -260,24 +241,10 @@ class LULCSegDataset(Dataset):
             mask_arr = np.array(mask).astype(np.int64)
             mask_t = torch.from_numpy(mask_arr)
 
-        meta_out: Optional[Dict[str, Any]] = None
-        if s.meta_raw is not None:
-            meta_out = {
-                "numeric": s.meta_num if s.meta_num is not None else encode_metadata_numeric(s.meta_raw),
-                "Location": s.meta_raw.get("Location", ""),
-                "Upazila": s.meta_raw.get("Upazila", ""),
-                "District": s.meta_raw.get("District", ""),
-                "Region Type": s.meta_raw.get("Region Type", ""),
-                "description": s.meta_raw.get("description", ""),
-            }
-            if self.return_raw_meta:
-                meta_out["raw"] = s.meta_raw
-
         return {
             "img": img_t,
             "mask": mask_t,
             "key": s.key,
             "impath": s.img_path,
             "maskpath": s.mask_path,
-            "meta": meta_out,
         }

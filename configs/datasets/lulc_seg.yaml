@@ -30,4 +30,3 @@ DATASET:
 
   # Optional sanity checks / debugging
   VALIDATE_LABELS: False
-  RETURN_RAW_META: False
