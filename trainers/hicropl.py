@@ -182,28 +182,133 @@ class CrossModalPromptLearner(nn.Module):
         #     f"Proceeding anyway; CLIP ViT will interpolate positional embeddings.")
 
         ######## cross-modal text token initialization ########
-        if ctx_init and (n_ctx) <= 4:
-            # use given words to initialize context vectors
-            ctx_init = ctx_init.replace("_", " ")
-            n_ctx = n_ctx
-            prompt = clip.tokenize(ctx_init)
-            with torch.no_grad():
-                embedding = clip_model.token_embedding(prompt).type(dtype)
-            ctx_vectors = embedding[0, 1: 1 + n_ctx, :]
-            prompt_prefix = ctx_init
-        else:
-            # random initialization
-            ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
-            nn.init.normal_(ctx_vectors, std=0.02)
-            prompt_prefix = " ".join(["X"] * n_ctx)
+        self.n_ctx = n_ctx  # helpful for other modules
+
+        # --- existing/default init (keep as fallback) ---
+        def _default_ctx_init():
+            nonlocal ctx_init, n_ctx
+            if ctx_init and (n_ctx) <= 4:
+                # use given words to initialize context vectors
+                ctx_init_ = ctx_init.replace("_", " ")
+                prompt = clip.tokenize(ctx_init_, context_length=77, truncate=True)
+                with torch.no_grad():
+                    embedding = clip_model.token_embedding(prompt).type(dtype)
+                ctx_vec = embedding[0, 1: 1 + n_ctx, :]
+                prefix = ctx_init_
+            else:
+                # random initialization
+                ctx_vec = torch.empty(n_ctx, ctx_dim, dtype=dtype)
+                nn.init.normal_(ctx_vec, std=0.02)
+                prefix = " ".join(["X"] * n_ctx)
+            return ctx_vec, prefix
+
+        ctx_vectors, prompt_prefix = _default_ctx_init()
+
+        # --- NEW: classdef-based init ---
+        ctx_init_mode = str(getattr(cfg.TRAINER.HICROPL, "CTX_INIT_MODE", "default")).lower()
+        classdef_file = str(getattr(cfg.TRAINER.HICROPL, "CTX_INIT_CLASSDEF_FILE", ""))
+        blend = float(getattr(cfg.TRAINER.HICROPL, "CTX_INIT_BLEND", 1.0))
+        blend = max(0.0, min(1.0, blend))
+
+        if ctx_init_mode == "classdef" and classdef_file:
+            # resolve path robustly
+            classdef_path = classdef_file
+            if not osp.isabs(classdef_path) and not osp.exists(classdef_path):
+                repo_root = osp.abspath(osp.join(osp.dirname(__file__), ".."))
+                cand = osp.join(repo_root, classdef_path)
+                if osp.exists(cand):
+                    classdef_path = cand
+
+            if osp.exists(classdef_path):
+                with open(classdef_path, "r", encoding="utf-8") as f:
+                    classdef = json.load(f)
+
+                # allow case-insensitive lookup
+                classdef_l = {str(k).strip().lower(): v for k, v in classdef.items()}
+
+                # build per-class definition texts
+                texts = []
+                for cname in classnames:
+                    key = str(cname).strip()
+                    defs = classdef.get(key, None)
+                    if defs is None:
+                        defs = classdef_l.get(key.lower(), None)
+
+                    if isinstance(defs, str):
+                        defs = [defs]
+                    if not defs:
+                        defs = [key]
+
+                    for d in defs:
+                        d = str(d).strip()
+                        if d:
+                            texts.append(f"{key}: {d}")
+
+                # tokenize and get token embeddings
+                # We round-robin non-padding tokens across classes so all classes contribute.
+                SOS_ID = 49406
+                EOT_ID = 49407
+
+                if len(texts) > 0:
+                    toks = clip.tokenize(texts, context_length=77, truncate=True)  # [M,77]
+                    with torch.no_grad():
+                        emb = clip_model.token_embedding(toks).type(dtype)         # [M,77,ctx_dim]
+
+                    per_row = []
+                    for i in range(toks.size(0)):
+                        ids = toks[i]
+                        mask = (ids != 0) & (ids != SOS_ID) & (ids != EOT_ID)
+                        vecs = emb[i][mask]  # [Li, ctx_dim]
+                        per_row.append(vecs)
+
+                    # round-robin pick n_ctx vectors from per_row
+                    selected = []
+                    ptr = [0] * len(per_row)
+
+                    # if everything is empty, keep default ctx_vectors
+                    if any(v.numel() > 0 for v in per_row):
+                        while len(selected) < n_ctx:
+                            progressed = False
+                            for i in range(len(per_row)):
+                                if ptr[i] < per_row[i].shape[0]:
+                                    selected.append(per_row[i][ptr[i]])
+                                    ptr[i] += 1
+                                    progressed = True
+                                    if len(selected) == n_ctx:
+                                        break
+                            if not progressed:
+                                # restart pointers to reuse tokens if pool is smaller than n_ctx
+                                ptr = [0] * len(per_row)
+
+                        ctx_new = torch.stack(selected, dim=0)  # [n_ctx, ctx_dim]
+
+                        # blend with previous init
+                        ctx_vectors = (1.0 - blend) * ctx_vectors + blend * ctx_new
+                        prompt_prefix = f"classdef_init({osp.basename(classdef_path)})"
+            else:
+                print(f'[WARN] CTX_INIT_CLASSDEF_FILE not found: "{classdef_file}" -> using default init')
+
         print(f"HiCroPL design: Hierarchical Cross-modal Prompt Learning")
         print(f'Initial text context: "{prompt_prefix}"')
         print(f"Number of HiCroPL context words (tokens): {n_ctx}")
+
         self.ctx = nn.Parameter(ctx_vectors)
+
         # create deeper prompts by nn.ParameterList
-        cross_prompts_text = nn.ParameterList([self.ctx] + [nn.Parameter(torch.empty(n_ctx, 512, dtype=dtype)) for _ in range(self.cross_prompts_depth - 1)])
-        for single_para in cross_prompts_text[1:]:
-            nn.init.normal_(single_para, std=0.02)
+        # - default mode: keep old behavior (random init for deep prompts)
+        # - classdef mode: copy shallow ctx to deep prompts (stable start)
+        cross_prompts_text = nn.ParameterList([self.ctx])
+
+        if ctx_init_mode == "classdef":
+            for _ in range(self.cross_prompts_depth - 1):
+                p = nn.Parameter(ctx_vectors.clone())
+                cross_prompts_text.append(p)
+        else:
+            for _ in range(self.cross_prompts_depth - 1):
+                p = nn.Parameter(torch.empty(n_ctx, 512, dtype=dtype))
+                nn.init.normal_(p, std=0.02)
+                cross_prompts_text.append(p)
+
         self.cross_prompts_text = cross_prompts_text
         ######## cross-modal text token initialization end ########
 
@@ -245,7 +350,8 @@ class CrossModalPromptLearner(nn.Module):
         clip_weights = gpt_clip_classifier(
             classnames, gpt3_prompt, clip_model_temp, cfg.DATASET.NAME
         )
-        self.fixed_embeddings = clip_weights
+        clip_weights = clip_weights.detach()
+        self.register_buffer("fixed_embeddings", clip_weights)
         ######## preparation for distillation end ########
 
         classnames = [name.replace("_", " ") for name in classnames]

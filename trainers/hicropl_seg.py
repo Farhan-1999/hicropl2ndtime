@@ -232,6 +232,26 @@ class CustomCLIPSeg(nn.Module):
 
         self.decoder = DeepLabV3EmbeddingHead(in_ch=in_ch, embed_dim=embed_dim, aspp_ch=aspp_ch, atrous_rates=atrous_rates)
 
+        # ---- Metadata-as-text conditioning (Option A) ----
+        self.use_meta_text = bool(getattr(seg_cfg, "USE_META_TEXT", False)) if seg_cfg is not None else False
+        self.meta_text_alpha = float(getattr(seg_cfg, "META_TEXT_ALPHA", 1.0)) if seg_cfg is not None else 1.0
+        self.meta_text_hidden = int(getattr(seg_cfg, "META_TEXT_HIDDEN", 256)) if seg_cfg is not None else 256
+
+        # keep a handle to the underlying CLIP model for encode_text
+        self.clip_model = clip_model  # <-- ensure you have clip_model in __init__ args
+
+        # Learnable mapping: meta_text_feat [B,D] -> delta [B,D]
+        # (shared delta applied to all classes)
+        if self.use_meta_text:
+            self.embed_dim = embed_dim # should match text_features dim
+            self.meta_delta_mlp = nn.Sequential(
+                nn.Linear(embed_dim, self.meta_text_hidden),
+                nn.ReLU(inplace=True),
+                nn.Linear(self.meta_text_hidden, embed_dim),
+            )
+        else:
+            self.meta_delta_mlp = None
+
         # Patch size for grid reshape (ViT-B/16 => 16)
         self.patch_size = getattr(seg_cfg, "PATCH_SIZE", 16) if seg_cfg is not None else 16
 
@@ -239,6 +259,7 @@ class CustomCLIPSeg(nn.Module):
         self,
         image: torch.Tensor,
         return_global: bool = False,
+        meta_tokens: torch.Tensor = None,  # [B,77] Long or None
     ):
         """
         Returns:
@@ -252,6 +273,45 @@ class CustomCLIPSeg(nn.Module):
         # Text features: [C, embed_dim]
         text_features = self.text_encoder(text_input, self.tokenized_prompts, cross_prompts_text_deeper)
         text_features = text_features / (text_features.norm(dim=-1, keepdim=True) + 1e-12)
+
+        # Prepare per-image text features: [B, C, D]
+        B = image.shape[0]
+        text_bcd = text_features.unsqueeze(0).expand(B, -1, -1)
+
+        # ---- Metadata text -> TextEncoder -> shared delta ----
+        if self.use_meta_text and (meta_tokens is not None) and (self.meta_delta_mlp is not None):
+            # encode metadata text with CLIP text encoder (frozen)
+            # ---- Encode metadata text using HiCroPL TextEncoder (NOT clip_model.encode_text) ----
+            # meta_tokens: [B,77]
+            mtok = meta_tokens.to(device=image.device)
+
+            B = mtok.size(0)
+            n_ctx = self.prompt_learner.n_ctx
+
+            # Token embeddings for metadata tokens
+            meta_emb = self.clip_model.token_embedding(mtok).type(self.dtype)  # [B,77,512]
+
+            # Build shallow-prompted metadata prompts: [SOS] + ctx + suffix
+            prefix = meta_emb[:, :1, :]                      # [B,1,512]
+            suffix = meta_emb[:, 1 + n_ctx :, :]             # [B,77-1-n_ctx,512]
+
+            ctx = self.prompt_learner.cross_prompts_text[0]  # [n_ctx,512]
+            if ctx.dim() == 2:
+                ctx = ctx.unsqueeze(0).expand(B, -1, -1)     # [B,n_ctx,512]
+            ctx = ctx.type(self.dtype)
+
+            meta_prompts = torch.cat([prefix, ctx, suffix], dim=1)  # [B,77,512]
+
+            # Encode with HiCroPL TextEncoder (passes [x, cross_prompts_text_deeper] correctly)
+            meta_feat = self.text_encoder(meta_prompts, mtok, cross_prompts_text_deeper)  # [B,D]
+            meta_feat = meta_feat.float()
+            meta_feat = meta_feat / (meta_feat.norm(dim=-1, keepdim=True) + 1e-12)
+
+            delta = self.meta_delta_mlp(meta_feat)  # [B, D]
+            # scale and broadcast to all classes
+            text_bcd = text_bcd + (self.meta_text_alpha * delta).unsqueeze(1)
+            # renormalize per (B,C)
+            text_bcd = text_bcd / (text_bcd.norm(dim=-1, keepdim=True) + 1e-12)
 
         # Visual forward: must provide patch tokens
         # (Your CLIP visual forward should be extended to return patch tokens.)
@@ -293,7 +353,7 @@ class CustomCLIPSeg(nn.Module):
         # Similarity logits
         logit_scale = self.logit_scale.exp()
         # logits: [B, C, H, W]
-        logits = logit_scale * torch.einsum("bchw,kc->bkhw", pix_emb, text_features)
+        logits = logit_scale * torch.einsum("bdhw,bcd->bchw", pix_emb, text_bcd)
 
         if return_global:
             return logits, global_feat
@@ -536,7 +596,7 @@ class HiCroPL_Seg(TrainerX):
         self.model = CustomCLIPSeg(cfg, classnames, clip_model)
 
         print("Turning off gradients in the CLIP encoders; training prompts + decoder")
-        train_keys = ("prompt_learner", "decoder")
+        train_keys = ("prompt_learner", "decoder", "meta_delta")
         for name, param in self.model.named_parameters():
             param.requires_grad_(any(k in name for k in train_keys))
 
@@ -549,6 +609,8 @@ class HiCroPL_Seg(TrainerX):
 
         self._init_seg_loss_cfg()
         self._init_desc_cfg()
+        self._init_meta_text_cfg()
+
 
         # ----------------------------
         # Optimizer with prompt-only LR
@@ -773,6 +835,55 @@ class HiCroPL_Seg(TrainerX):
         self.desc_bank = cleaned
 
         print(f"[DESC] Enabled. Loaded {len(self.desc_bank)} embeddings from {self.desc_bank_path}")
+    
+    def _init_meta_text_cfg(self):
+        seg_cfg = getattr(self.cfg.TRAINER, "HICROPL_SEG", None)
+
+        self.use_meta_text = bool(getattr(seg_cfg, "USE_META_TEXT", False)) if seg_cfg is not None else False
+        self.meta_text_bank_path = str(getattr(seg_cfg, "META_TEXT_BANK", "data/bing_rgb/meta_token_bank.pt")) if seg_cfg is not None else "data/bing_rgb/meta_token_bank.pt"
+
+        self.meta_token_bank = None
+        self.meta_default_tok = None
+
+        if not self.use_meta_text:
+            return
+
+        if not osp.exists(self.meta_text_bank_path):
+            raise FileNotFoundError(
+                f"[META-TOK] token bank not found: {self.meta_text_bank_path}\n"
+                f"Run: python tools/precompute_meta_token_bank.py --root data/bing_rgb"
+            )
+
+        bank = torch.load(self.meta_text_bank_path, map_location="cpu")
+        if not isinstance(bank, dict) or len(bank) == 0:
+            raise RuntimeError(f"[META-TOK] invalid/empty bank: {self.meta_text_bank_path}")
+
+        default_tok = bank.get("__default__", None)
+        if default_tok is None:
+            raise RuntimeError("[META-TOK] bank missing '__default__' token")
+
+        self.meta_token_bank = bank
+        self.meta_default_tok = default_tok.long().view(-1)  # [77]
+        print(f"[META-TOK] Enabled. Loaded {len(bank)-1} tokens (+default) from {self.meta_text_bank_path}")
+
+
+    def _get_meta_tokens(self, batch) -> torch.Tensor:
+        """Return LongTensor [B,77] on device (or None if disabled)."""
+        if not getattr(self, "use_meta_text", False) or (self.meta_token_bank is None):
+            return None
+
+        keys = batch.get("key", None)
+        if keys is None:
+            return None
+
+        B = len(keys)
+        out = torch.empty((B, 77), dtype=torch.long)
+        for i, k in enumerate(keys):
+            tok = self.meta_token_bank.get(k, None)
+            if tok is None:
+                tok = self.meta_default_tok
+            out[i].copy_(tok.view(-1).long())
+        return out.to(self.device, non_blocking=True)
 
 
     def _init_seg_loss_cfg(self):
@@ -876,9 +987,12 @@ class HiCroPL_Seg(TrainerX):
         img: torch.Tensor,  # [1,3,H,W]
         tile: int = 224,
         stride: int = 112,
+        meta_tokens: torch.Tensor = None,  # [1,77] LongTensor or None
     ) -> torch.Tensor:
         """Run sliding-window inference and stitch logits back to [1,C,H,W]."""
         assert img.dim() == 4 and img.size(0) == 1, "Pass a single image [1,3,H,W]"
+        if meta_tokens is not None:
+            assert meta_tokens.dim() == 2 and meta_tokens.size(0) == 1, "meta_tokens must be [1,77] for a single image"
         device = img.device
         _, _, H, W = img.shape
         C = self.num_classes
@@ -904,15 +1018,19 @@ class HiCroPL_Seg(TrainerX):
 
         prec = self.cfg.TRAINER.HICROPL.PREC
 
+        # Ensure meta tokens are on the same device (if provided)
+        if meta_tokens is not None:
+            meta_tokens = meta_tokens.to(device=device, non_blocking=True)
+
         for y in ys:
             for x in xs:
                 patch = img[:, :, y:y + tile, x:x + tile]
 
                 if prec == "amp":
                     with autocast():
-                        logits_patch = self.model(patch)
+                        logits_patch = self.model(patch, meta_tokens=meta_tokens)
                 else:
-                    logits_patch = self.model(patch)
+                    logits_patch = self.model(patch, meta_tokens=meta_tokens)
 
                 logits_patch = logits_patch.float()
 
@@ -931,6 +1049,7 @@ class HiCroPL_Seg(TrainerX):
         """
         img, mask = self.parse_batch_train(batch_x)
 
+        meta_tokens = self._get_meta_tokens(batch_x)
         prec = self.cfg.TRAINER.HICROPL.PREC
         ignore_index = int(getattr(self.cfg.DATASET, "IGNORE_INDEX", 255))
 
@@ -948,9 +1067,9 @@ class HiCroPL_Seg(TrainerX):
         if prec == "amp":
             with autocast():
                 if getattr(self, "use_desc", False):
-                    logits, img_global = self.model(img, return_global=True)
+                    logits, img_global = self.model(img, return_global=True, meta_tokens=meta_tokens)
                 else:
-                    logits = self.model(img)
+                    logits = self.model(img, meta_tokens=meta_tokens)
 
             loss_seg, comps = self._compute_seg_loss(logits, mask, ignore_index)
             loss = loss_seg
@@ -1118,6 +1237,7 @@ class HiCroPL_Seg(TrainerX):
 
         for batch in loader:
             img, mask = self.parse_batch_test(batch)
+            meta_tokens = self._get_meta_tokens(batch)
 
             tile = int(self.cfg.INPUT.SIZE[0])  # 224
             stride = tile // 2                 # 112
@@ -1127,17 +1247,18 @@ class HiCroPL_Seg(TrainerX):
 
             for i in range(B):
                 img_i = img[i:i+1]
+                meta_i = None if meta_tokens is None else meta_tokens[i:i+1]
 
                 # If test images are larger than tile, use sliding window
                 if img_i.size(-1) > tile or img_i.size(-2) > tile:
-                    logits_i = self._sliding_window_logits(img_i, tile=tile, stride=stride)
+                    logits_i = self._sliding_window_logits(img_i, tile=tile, stride=stride, meta_tokens=meta_i)
                 else:
                     prec = self.cfg.TRAINER.HICROPL.PREC
                     if prec == "amp":
                         with autocast():
-                            logits_i = self.model(img_i)
+                            logits_i = self.model(img_i, meta_tokens=meta_i)
                     else:
-                        logits_i = self.model(img_i)
+                        logits_i = self.model(img_i, meta_tokens=meta_i)
 
                     logits_i = logits_i.float()
 
@@ -1208,4 +1329,3 @@ class HiCroPL_Seg(TrainerX):
             wandb.log(log_dict)
 
         return float(miou)
-
