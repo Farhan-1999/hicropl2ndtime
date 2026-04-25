@@ -114,3 +114,64 @@ class MaskTransformer(nn.Module):
                 x = blk(x)
             else:
                 return blk(x, return_attention=True)
+
+class DecoderLinearEmbed(nn.Module):
+    """Segmenter-style linear decoder that outputs embedding map [B, D, GS, GS]."""
+    def __init__(self, patch_size, d_encoder, embed_dim):
+        super().__init__()
+        self.patch_size = patch_size
+        self.d_encoder = d_encoder
+        self.embed_dim = embed_dim
+        self.proj = nn.Linear(d_encoder, embed_dim)
+        self.apply(init_weights)
+
+    def forward(self, x, im_size):
+        H, W = im_size
+        GS = H // self.patch_size
+        x = self.proj(x)  # [B, N, D]
+        x = rearrange(x, "b (h w) c -> b c h w", h=GS)
+        return x
+
+
+class MaskTransformerEmbed(nn.Module):
+    """Segmenter mask-transformer decoder but returning patch embeddings (no class tokens)."""
+    def __init__(
+        self,
+        patch_size,
+        d_encoder,
+        n_layers,
+        n_heads,
+        d_model,
+        d_ff,
+        drop_path_rate,
+        dropout,
+        embed_dim,
+    ):
+        super().__init__()
+        self.patch_size = patch_size
+        self.d_encoder = d_encoder
+        self.d_model = d_model
+        self.embed_dim = embed_dim
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, n_layers)]
+        self.blocks = nn.ModuleList(
+            [Block(d_model, n_heads, d_ff, dropout, dpr[i]) for i in range(n_layers)]
+        )
+
+        self.proj_dec = nn.Linear(d_encoder, d_model)
+        self.decoder_norm = nn.LayerNorm(d_model)
+        self.to_embed = nn.Linear(d_model, embed_dim)
+
+        self.apply(init_weights)
+
+    def forward(self, x, im_size):
+        H, W = im_size
+        GS = H // self.patch_size
+
+        x = self.proj_dec(x)  # [B, N, d_model]
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.decoder_norm(x)
+        x = self.to_embed(x)  # [B, N, embed_dim]
+        x = rearrange(x, "b (h w) c -> b c h w", h=int(GS))
+        return x
