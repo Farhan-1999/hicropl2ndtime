@@ -318,13 +318,28 @@ class CustomCLIPSeg(nn.Module):
         else:
             self.meta_delta_mlp = None
 
+        # ---- Image-description direct fusion (per-image frozen desc embedding -> delta) ----
+        self.use_desc_direct = bool(getattr(seg_cfg, "USE_DESC_DIRECT", False)) if seg_cfg is not None else False
+        self.desc_direct_alpha = float(getattr(seg_cfg, "DESC_DIRECT_ALPHA", 1.0)) if seg_cfg is not None else 1.0
+        self.desc_direct_hidden = int(getattr(seg_cfg, "DESC_DIRECT_HIDDEN", 256)) if seg_cfg is not None else 256
+
+        if self.use_desc_direct:
+            self.desc_delta_mlp = nn.Sequential(
+                nn.Linear(embed_dim, self.desc_direct_hidden),
+                nn.ReLU(inplace=True),
+                nn.Linear(self.desc_direct_hidden, embed_dim),
+            )
+        else:
+            self.desc_delta_mlp = None
+
         # Patch size for grid reshape (ViT-B/16 => 16)
 
     def forward(
         self,
         image: torch.Tensor,
         return_global: bool = False,
-        meta_tokens: torch.Tensor = None,  # [B,77] Long or None
+        meta_tokens: torch.Tensor = None,
+        desc_emb: torch.Tensor = None,   # [B,D] or None
     ):
         """
         Returns:
@@ -360,6 +375,15 @@ class CustomCLIPSeg(nn.Module):
         # Prepare per-image text features: [B, C, D]
         B = image.shape[0]
         text_bcd = text_features.unsqueeze(0).expand(B, -1, -1)
+
+        # ---- Image description embedding -> shared delta for all classes ----
+        if self.use_desc_direct and (desc_emb is not None) and (self.desc_delta_mlp is not None):
+            d = desc_emb.to(device=image.device, dtype=text_bcd.dtype)   # [B,D]
+            d = d / (d.norm(dim=-1, keepdim=True) + 1e-12)
+
+            desc_delta = self.desc_delta_mlp(d)  # [B,D]
+            text_bcd = text_bcd + (self.desc_direct_alpha * desc_delta).unsqueeze(1)
+            text_bcd = text_bcd / (text_bcd.norm(dim=-1, keepdim=True) + 1e-12)
 
         # ---- Metadata text -> TextEncoder -> shared delta ----
         if self.use_meta_text and (meta_tokens is not None) and (self.meta_delta_mlp is not None):
@@ -689,7 +713,7 @@ class HiCroPL_Seg(TrainerX):
         self.model = CustomCLIPSeg(cfg, classnames, clip_model)
 
         print("Turning off gradients in the CLIP encoders; training prompts + decoder")
-        train_keys = ("prompt_learner", "decoder", "meta_delta")
+        train_keys = ("prompt_learner", "decoder", "meta_delta", "desc_delta")
         for name, param in self.model.named_parameters():
             param.requires_grad_(any(k in name for k in train_keys))
 
@@ -900,11 +924,12 @@ class HiCroPL_Seg(TrainerX):
         seg_cfg = getattr(self.cfg.TRAINER, "HICROPL_SEG", None)
 
         self.use_desc = bool(getattr(seg_cfg, "USE_DESC", False)) if seg_cfg is not None else False
+        self.use_desc_direct = bool(getattr(seg_cfg, "USE_DESC_DIRECT", False)) if seg_cfg is not None else False
         self.desc_w = float(getattr(seg_cfg, "DESC_W", 0.1)) if seg_cfg is not None else 0.1
         self.desc_bank_path = str(getattr(seg_cfg, "DESC_BANK", "data/bing_rgb/desc_emb_bank.pt")) if seg_cfg is not None else "data/bing_rgb/desc_emb_bank.pt"
 
         self.desc_bank = None
-        if not self.use_desc:
+        if not (self.use_desc or self.use_desc_direct):
             return
 
         if not osp.exists(self.desc_bank_path):
@@ -976,6 +1001,36 @@ class HiCroPL_Seg(TrainerX):
             if tok is None:
                 tok = self.meta_default_tok
             out[i].copy_(tok.view(-1).long())
+        return out.to(self.device, non_blocking=True)
+
+    def _get_desc_emb(self, batch) -> torch.Tensor:
+        """Return FloatTensor [B,D] on device (or None if disabled / unavailable)."""
+        if not (getattr(self, "use_desc", False) or getattr(self, "use_desc_direct", False)):
+            return None
+        if self.desc_bank is None:
+            return None
+
+        keys = batch.get("key", None)
+        if keys is None:
+            return None
+
+        # infer embedding dim from first entry
+        sample = next(iter(self.desc_bank.values()))
+        D = int(sample.numel())
+
+        B = len(keys)
+        out = torch.zeros((B, D), dtype=torch.float32)
+        found_any = False
+
+        for i, k in enumerate(keys):
+            te = self.desc_bank.get(k, None)
+            if te is not None:
+                out[i].copy_(te.view(-1).float())
+                found_any = True
+
+        if not found_any:
+            return None
+
         return out.to(self.device, non_blocking=True)
 
 
@@ -1077,10 +1132,11 @@ class HiCroPL_Seg(TrainerX):
     @torch.no_grad()
     def _sliding_window_logits(
         self,
-        img: torch.Tensor,  # [1,3,H,W]
+        img: torch.Tensor,
         tile: int = 224,
         stride: int = 112,
-        meta_tokens: torch.Tensor = None,  # [1,77] LongTensor or None
+        meta_tokens: torch.Tensor = None,
+        desc_emb: torch.Tensor = None,
     ) -> torch.Tensor:
         """Run sliding-window inference and stitch logits back to [1,C,H,W]."""
         assert img.dim() == 4 and img.size(0) == 1, "Pass a single image [1,3,H,W]"
@@ -1121,9 +1177,9 @@ class HiCroPL_Seg(TrainerX):
 
                 if prec == "amp":
                     with autocast():
-                        logits_patch = self.model(patch, meta_tokens=meta_tokens)
+                        logits_patch = self.model(patch, meta_tokens=meta_tokens, desc_emb=desc_emb)
                 else:
-                    logits_patch = self.model(patch, meta_tokens=meta_tokens)
+                    logits_patch = self.model(patch, meta_tokens=meta_tokens, desc_emb=desc_emb)
 
                 logits_patch = logits_patch.float()
 
@@ -1143,6 +1199,7 @@ class HiCroPL_Seg(TrainerX):
         img, mask = self.parse_batch_train(batch_x)
 
         meta_tokens = self._get_meta_tokens(batch_x)
+        desc_emb = self._get_desc_emb(batch_x)
         prec = self.cfg.TRAINER.HICROPL.PREC
         ignore_index = int(getattr(self.cfg.DATASET, "IGNORE_INDEX", 255))
 
@@ -1160,9 +1217,18 @@ class HiCroPL_Seg(TrainerX):
         if prec == "amp":
             with autocast():
                 if getattr(self, "use_desc", False):
-                    logits, img_global = self.model(img, return_global=True, meta_tokens=meta_tokens)
+                    logits, img_global = self.model(
+                        img,
+                        return_global=True,
+                        meta_tokens=meta_tokens,
+                        desc_emb=desc_emb,
+                    )
                 else:
-                    logits = self.model(img, meta_tokens=meta_tokens)
+                    logits = self.model(
+                        img,
+                        meta_tokens=meta_tokens,
+                        desc_emb=desc_emb,
+                    )
 
             loss_seg, comps = self._compute_seg_loss(logits, mask, ignore_index)
             loss = loss_seg
@@ -1206,9 +1272,18 @@ class HiCroPL_Seg(TrainerX):
         else:
             # Forward
             if getattr(self, "use_desc", False):
-                logits, img_global = self.model(img, return_global=True, meta_tokens=meta_tokens)
+                logits, img_global = self.model(
+                    img,
+                    return_global=True,
+                    meta_tokens=meta_tokens,
+                    desc_emb=desc_emb,
+                )
             else:
-                logits = self.model(img, meta_tokens=meta_tokens)
+                logits = self.model(
+                    img,
+                    meta_tokens=meta_tokens,
+                    desc_emb=desc_emb,
+                )
 
             # Segmentation loss (unchanged)
             loss_seg, comps = self._compute_seg_loss(logits, mask, ignore_index)
@@ -1331,6 +1406,7 @@ class HiCroPL_Seg(TrainerX):
         for batch in loader:
             img, mask = self.parse_batch_test(batch)
             meta_tokens = self._get_meta_tokens(batch)
+            desc_emb = self._get_desc_emb(batch)
 
             tile = int(self.cfg.INPUT.SIZE[0])  # 224
             stride = tile // 2                 # 112
@@ -1341,17 +1417,24 @@ class HiCroPL_Seg(TrainerX):
             for i in range(B):
                 img_i = img[i:i+1]
                 meta_i = None if meta_tokens is None else meta_tokens[i:i+1]
+                desc_i = None if desc_emb is None else desc_emb[i:i+1]
 
                 # If test images are larger than tile, use sliding window
                 if img_i.size(-1) > tile or img_i.size(-2) > tile:
-                    logits_i = self._sliding_window_logits(img_i, tile=tile, stride=stride, meta_tokens=meta_i)
+                    logits_i = self._sliding_window_logits(
+                        img_i,
+                        tile=tile,
+                        stride=stride,
+                        meta_tokens=meta_i,
+                        desc_emb=desc_i,
+                    )
                 else:
                     prec = self.cfg.TRAINER.HICROPL.PREC
                     if prec == "amp":
                         with autocast():
-                            logits_i = self.model(img_i, meta_tokens=meta_i)
+                            logits_i = self.model(img_i, meta_tokens=meta_i, desc_emb=desc_i)
                     else:
-                        logits_i = self.model(img_i, meta_tokens=meta_i)
+                        logits_i = self.model(img_i, meta_tokens=meta_i, desc_emb=desc_i)
 
                     logits_i = logits_i.float()
 

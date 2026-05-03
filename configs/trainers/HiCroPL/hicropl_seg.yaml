@@ -90,6 +90,10 @@ TRAINER:
     DESC_W: 0.1
     DESC_BANK: "gid/desc_emb_bank.pt"
 
+    USE_DESC_DIRECT: False      # NEW: make desc affect logits directly
+    DESC_DIRECT_ALPHA: 1.0
+    DESC_DIRECT_HIDDEN: 256
+
     # # Per-image metadata text alignment (teacher from metadata.json)
     # USE_META: True
     # # META_W: 0.1
