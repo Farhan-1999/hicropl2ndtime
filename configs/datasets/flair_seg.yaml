@@ -1,0 +1,38 @@
+DATASET:
+  NAME: "FLAIRSegDataset"
+  ROOT: "flair"
+
+  NUM_CLASSES: 12
+
+  CLASSNAMES: [
+    "building",
+    "pervious surface",
+    "impervious surface",
+    "bare soil",
+    "water",
+    "coniferous",
+    "deciduous",
+    "brushwood",
+    "vineyard",
+    "herbaceous vegetation",
+    "agricultural land",
+    "plowed land",
+  ]
+
+  # Raw FLAIR masks:
+  #   1..12 = target classes
+  #   13    = "other" -> ignored in dataset loader
+  IGNORE_INDEX: 255
+  VALIDATE_LABELS: True
+
+INPUT:
+  SIZE: (512, 512)
+  CROP_SIZE: (512, 512)
+  INTERPOLATION: "bicubic"
+  SCALE_RANGE: (0.5, 2.0)
+
+  # CLIP normalization
+  PIXEL_MEAN: [0.48145466, 0.4578275, 0.40821073]
+  PIXEL_STD: [0.26862954, 0.26130258, 0.27577711]
+
+  TRANSFORMS: ["random_resized_crop", "random_flip", "normalize"]

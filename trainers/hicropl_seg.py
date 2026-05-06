@@ -45,6 +45,7 @@ from datasets.lulc_seg import LULCSegDataset, CLASSNAMES_LULC_6
 from copy import deepcopy
 
 import datasets.gid_seg
+import datasets.flair_seg
 
 
 

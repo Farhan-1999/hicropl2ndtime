@@ -86,7 +86,7 @@ TRAINER:
     CLASS_WEIGHTS: ()
 
     # USE_DESC: True
-    USE_DESC: True
+    USE_DESC: False
     DESC_W: 0.1
     DESC_BANK: "gid/desc_emb_bank.pt"
 
@@ -101,12 +101,12 @@ TRAINER:
     # META_HIDDEN: 256
 
     # Metadata as per-image text input (Option A: shared delta for all classes)
-    USE_META_TEXT: True
+    USE_META_TEXT: False
     META_TEXT_BANK: "gid/meta_token_bank.pt"
     META_TEXT_ALPHA: 1.0
     META_TEXT_HIDDEN: 256  
 
-    USE_CLASS_DESC: True
+    USE_CLASS_DESC: False
     # USE_CLASS_DESC: True
     CLASS_DESC_ALPHA: 2.0
 
