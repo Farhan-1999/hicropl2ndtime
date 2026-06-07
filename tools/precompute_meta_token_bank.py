@@ -41,27 +41,23 @@ def _km(x: Any) -> str:
 
 
 def meta_to_text(m: Dict[str, Any]) -> str:
-    region = str(m.get("Region Type", "")).strip()
-    pop = _num(m.get("Population Density"))
-    lit = _num(m.get("Literacy"))
-    d_dist = _km(m.get("distance_to_district_sadar"))
-    d_upz = _km(m.get("distance_to_upazila_sadar"))
-    in_dist = _yn(m.get("inside_district_sadar"))
-    in_upz = _yn(m.get("inside_upazila_sadar"))
+    gdp = str(m.get("GDP (in billion yuan)", "")).strip()
+    pop = str(m.get("Population", "")).strip()
+    area = str(m.get("Area (in sq km)", "")).strip()
+    lit = m.get("Literacy Rate", "")
+    dens = str(m.get("Density", "")).strip()
 
     parts = []
-    if region:
-        parts.append(f"Region type: {region}.")
+    if gdp:
+        parts.append(f"GDP {gdp} billion yuan.")
     if pop:
-        parts.append(f"Population density: {pop}.")
-    if lit:
-        parts.append(f"Literacy: {lit}.")
-    if d_dist:
-        parts.append(f"Distance to district sadar: {d_dist}.")
-    if d_upz:
-        parts.append(f"Distance to upazila sadar: {d_upz}.")
-    parts.append(f"Inside district sadar: {in_dist}.")
-    parts.append(f"Inside upazila sadar: {in_upz}.")
+        parts.append(f"Population {pop}.")
+    if area:
+        parts.append(f"Area {area} sq km.")
+    if lit != "" and lit is not None:
+        parts.append(f"Literacy {float(lit):.2f} percent.")
+    if dens:
+        parts.append(f"Population density {dens} per sq km.")
     return " ".join(parts).strip()
 
 

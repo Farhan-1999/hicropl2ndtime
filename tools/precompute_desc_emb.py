@@ -36,7 +36,7 @@ def wrap_desc(text: str) -> str:
 @torch.no_grad()
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", type=str, default="data/bing_rgb")
+    ap.add_argument("--root", type=str, default="gid")
     ap.add_argument("--desc_json", type=str, default="description.json")
     ap.add_argument("--model", type=str, default="ViT-B/16")
     ap.add_argument("--out", type=str, default="desc_emb_bank.pt")
@@ -88,7 +88,7 @@ def main():
     for start in range(0, len(items), bs):
         chunk = items[start : start + bs]
         keys = [k for k, _ in chunk]
-        texts = [wrap_desc(shorten_desc(t)) for _, t in chunk]
+        texts = [wrap_desc(str(t.get("description", "")).strip()) for _, t in chunk]
 
         tokens = clip_lib.tokenize(texts, context_length=77, truncate=True).to(device)
 

@@ -1,0 +1,34 @@
+# configs/datasets/gid_seg.yaml
+DATASET:
+  # Change this to your actual dataset path if needed
+  NAME: "GIDSegDataset"
+  ROOT: "gid_patch"
+
+  NUM_CLASSES: 6
+
+  CLASSNAMES: [
+    "Background", # 1
+    "Built-up", # 2
+    "Farmland", # 3
+    "Forest", # 4
+    "Meadow", # 5
+    "Water", # 6
+  ]
+
+  # Your masks are named like: <stem>_24label.png
+  MASK_SUFFIX: "_5label"
+
+  IGNORE_INDEX: 255
+  VALIDATE_LABELS: True
+
+INPUT:
+  SIZE: (224, 224)
+  CROP_SIZE: (224, 224)
+  INTERPOLATION: "bicubic"
+  SCALE_RANGE: (0.5, 2.0)
+
+  # CLIP normalization
+  PIXEL_MEAN: [0.48145466, 0.4578275, 0.40821073]
+  PIXEL_STD:  [0.26862954, 0.26130258, 0.27577711]
+
+  TRANSFORMS: ["random_resized_crop", "random_flip", "normalize"]

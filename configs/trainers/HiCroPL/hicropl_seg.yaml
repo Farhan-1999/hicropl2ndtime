@@ -64,7 +64,7 @@ TRAINER:
   HICROPL:
     N_CTX: 16
     CROSS_LAYER: 6
-    CTX_INIT: "a photo of a"
+    CTX_INIT: ""
     PREC: "amp"           # "fp16" | "fp32" | "amp"
     PROMPT_DEPTH: 12
     TEACHER_NAME: "ViT-B/16"
@@ -86,9 +86,13 @@ TRAINER:
     CLASS_WEIGHTS: ()
 
     # USE_DESC: True
-    USE_DESC: False
+    USE_DESC: True
     DESC_W: 0.1
-    DESC_BANK: "data/bing_rgb/desc_emb_bank.pt"
+    DESC_BANK: "flair/desc_emb_bank.pt"
+
+    USE_DESC_DIRECT: False      # NEW: make desc affect logits directly
+    DESC_DIRECT_ALPHA: 1.0
+    DESC_DIRECT_HIDDEN: 256
 
     # # Per-image metadata text alignment (teacher from metadata.json)
     # USE_META: True
@@ -98,10 +102,18 @@ TRAINER:
 
     # Metadata as per-image text input (Option A: shared delta for all classes)
     USE_META_TEXT: False
-    META_TEXT_BANK: "data/bing_rgb/meta_token_bank.pt"
+    META_TEXT_BANK: "gid/meta_token_bank.pt"
     META_TEXT_ALPHA: 1.0
     META_TEXT_HIDDEN: 256  
 
-    USE_CLASS_DESC: False
+    USE_CLASS_DESC: True
     # USE_CLASS_DESC: True
     CLASS_DESC_ALPHA: 2.0
+
+    DECODER: "deeplabv3"     # or "seg_linear"
+    SEG_N_LAYERS: 2
+    SEG_N_HEADS: 8
+    SEG_D_MODEL: 256
+    SEG_D_FF: 1024
+    SEG_DROP_PATH: 0.0
+    SEG_DROPOUT: 0.0

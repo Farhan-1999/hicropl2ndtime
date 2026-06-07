@@ -34,16 +34,50 @@ from torch.utils.data import DataLoader
 
 from dassl.engine import TRAINER_REGISTRY, TrainerX
 from dassl.optim import build_optimizer, build_lr_scheduler
+from dassl.data.datasets import DATASET_REGISTRY
 
 from dassl.data.transforms import build_seg_transform
 
+from segm.model.decoder import DecoderLinearEmbed, MaskTransformerEmbed
+
 from datasets.lulc_seg import LULCSegDataset, CLASSNAMES_LULC_6
+
+from copy import deepcopy
+
+import datasets.gid_seg
+import datasets.flair_seg
 
 
 
 # Reuse HiCroPL core components exactly (keeps hierarchical transfer + LKP intact)
 from .hicropl import load_clip_to_cpu, CrossModalPromptLearner, TextEncoder
 import wandb
+
+import inspect
+
+def build_seg_dataset_from_cfg(cfg, split, transform, root_dir, validate_labels=False):
+    ds_name = getattr(cfg.DATASET, "NAME", "LULCSegDataset")
+    DatasetClass = DATASET_REGISTRY.get(ds_name)
+
+    kwargs = dict(
+        root=root_dir,
+        split=split,
+        transforms=transform,
+        classnames=getattr(cfg.DATASET, "CLASSNAMES", None),
+        mask_suffix=getattr(cfg.DATASET, "MASK_SUFFIX", "_gt"),
+        ignore_index=getattr(cfg.DATASET, "IGNORE_INDEX", 255),
+        validate_labels=validate_labels,
+    )
+
+    # Optional for GID if masks are 1..24
+    if hasattr(cfg.DATASET, "LABEL_OFFSET"):
+        kwargs["label_offset"] = cfg.DATASET.LABEL_OFFSET
+
+    # Keep only args that this dataset class actually supports
+    sig = inspect.signature(DatasetClass.__init__)
+    kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+
+    return DatasetClass(**kwargs)
 
 # -------------------------
 # DeepLabV3-style decoder
@@ -226,11 +260,44 @@ class CustomCLIPSeg(nn.Module):
 
         # Optional config knobs
         seg_cfg = getattr(cfg.TRAINER, "HICROPL_SEG", None)
+        # ---- Class-description fusion (frozen CLIP class prototypes) ----
+        self.use_class_desc = bool(getattr(seg_cfg, "USE_CLASS_DESC", False)) if seg_cfg is not None else False
+        self.class_desc_alpha = float(getattr(seg_cfg, "CLASS_DESC_ALPHA", 1.0)) if seg_cfg is not None else 1.0
+        self.patch_size = getattr(seg_cfg, "PATCH_SIZE", 16) if seg_cfg is not None else 16
         aspp_ch = getattr(seg_cfg, "ASPP_CHANNELS", 256) if seg_cfg is not None else 256
         # atrous rates can be tuned; keep standard DeepLabV3 defaults
         atrous_rates = getattr(seg_cfg, "ATROUS_RATES", (6, 12, 18)) if seg_cfg is not None else (6, 12, 18)
 
-        self.decoder = DeepLabV3EmbeddingHead(in_ch=in_ch, embed_dim=embed_dim, aspp_ch=aspp_ch, atrous_rates=atrous_rates)
+        decoder_name = str(getattr(seg_cfg, "DECODER", "deeplabv3")).lower()
+
+        if decoder_name == "deeplabv3":
+            self.decoder = DeepLabV3EmbeddingHead(
+                in_ch=in_ch, embed_dim=embed_dim, aspp_ch=aspp_ch, atrous_rates=atrous_rates
+            )
+            self._decoder_expects_tokens = False
+        else:
+            # Segmenter decoders operate on patch tokens [B, N, d_encoder]
+            self._decoder_expects_tokens = True
+            d_encoder = in_ch  # your patch token dim (e.g., 768)
+
+            if decoder_name == "seg_linear":
+                self.decoder = DecoderLinearEmbed(
+                    patch_size=self.patch_size, d_encoder=d_encoder, embed_dim=embed_dim
+                )
+            elif decoder_name == "seg_mask":
+                self.decoder = MaskTransformerEmbed(
+                    patch_size=self.patch_size,
+                    d_encoder=d_encoder,
+                    n_layers=int(getattr(seg_cfg, "SEG_N_LAYERS", 2)),
+                    n_heads=int(getattr(seg_cfg, "SEG_N_HEADS", 8)),
+                    d_model=int(getattr(seg_cfg, "SEG_D_MODEL", 256)),
+                    d_ff=int(getattr(seg_cfg, "SEG_D_FF", 1024)),
+                    drop_path_rate=float(getattr(seg_cfg, "SEG_DROP_PATH", 0.0)),
+                    dropout=float(getattr(seg_cfg, "SEG_DROPOUT", 0.0)),
+                    embed_dim=embed_dim,
+                )
+            else:
+                raise ValueError(f"Unknown HICROPL_SEG.DECODER: {decoder_name}")
 
         # ---- Metadata-as-text conditioning (Option A) ----
         self.use_meta_text = bool(getattr(seg_cfg, "USE_META_TEXT", False)) if seg_cfg is not None else False
@@ -252,14 +319,28 @@ class CustomCLIPSeg(nn.Module):
         else:
             self.meta_delta_mlp = None
 
+        # ---- Image-description direct fusion (per-image frozen desc embedding -> delta) ----
+        self.use_desc_direct = bool(getattr(seg_cfg, "USE_DESC_DIRECT", False)) if seg_cfg is not None else False
+        self.desc_direct_alpha = float(getattr(seg_cfg, "DESC_DIRECT_ALPHA", 1.0)) if seg_cfg is not None else 1.0
+        self.desc_direct_hidden = int(getattr(seg_cfg, "DESC_DIRECT_HIDDEN", 256)) if seg_cfg is not None else 256
+
+        if self.use_desc_direct:
+            self.desc_delta_mlp = nn.Sequential(
+                nn.Linear(embed_dim, self.desc_direct_hidden),
+                nn.ReLU(inplace=True),
+                nn.Linear(self.desc_direct_hidden, embed_dim),
+            )
+        else:
+            self.desc_delta_mlp = None
+
         # Patch size for grid reshape (ViT-B/16 => 16)
-        self.patch_size = getattr(seg_cfg, "PATCH_SIZE", 16) if seg_cfg is not None else 16
 
     def forward(
         self,
         image: torch.Tensor,
         return_global: bool = False,
-        meta_tokens: torch.Tensor = None,  # [B,77] Long or None
+        meta_tokens: torch.Tensor = None,
+        desc_emb: torch.Tensor = None,   # [B,D] or None
     ):
         """
         Returns:
@@ -274,9 +355,36 @@ class CustomCLIPSeg(nn.Module):
         text_features = self.text_encoder(text_input, self.tokenized_prompts, cross_prompts_text_deeper)
         text_features = text_features / (text_features.norm(dim=-1, keepdim=True) + 1e-12)
 
+        # ---- Inject class-description embeddings (frozen) into class text features ----
+        # fixed_embeddings are computed in CrossModalPromptLearner from gpt_file/*_prompt.json
+        # (see trainers/hicropl.py where fixed_embeddings is registered). :contentReference[oaicite:3]{index=3}
+        if getattr(self, "use_class_desc", False):
+            fixed = getattr(self.prompt_learner, "fixed_embeddings", None)
+            if fixed is not None:
+                fixed = fixed.to(device=text_features.device, dtype=text_features.dtype)
+
+                # safety: shape must match [C, D]
+                if fixed.shape == text_features.shape:
+                    fixed = fixed / (fixed.norm(dim=-1, keepdim=True) + 1e-12)
+                    text_features = text_features + (self.class_desc_alpha * fixed)
+                    text_features = text_features / (text_features.norm(dim=-1, keepdim=True) + 1e-12)
+                else:
+                    # optional: warn once
+                    # print(f"[WARN] fixed_embeddings shape {tuple(fixed.shape)} != text_features {tuple(text_features.shape)}; skipping class-desc fusion")
+                    pass
+
         # Prepare per-image text features: [B, C, D]
         B = image.shape[0]
         text_bcd = text_features.unsqueeze(0).expand(B, -1, -1)
+
+        # ---- Image description embedding -> shared delta for all classes ----
+        if self.use_desc_direct and (desc_emb is not None) and (self.desc_delta_mlp is not None):
+            d = desc_emb.to(device=image.device, dtype=text_bcd.dtype)   # [B,D]
+            d = d / (d.norm(dim=-1, keepdim=True) + 1e-12)
+
+            desc_delta = self.desc_delta_mlp(d)  # [B,D]
+            text_bcd = text_bcd + (self.desc_direct_alpha * desc_delta).unsqueeze(1)
+            text_bcd = text_bcd / (text_bcd.norm(dim=-1, keepdim=True) + 1e-12)
 
         # ---- Metadata text -> TextEncoder -> shared delta ----
         if self.use_meta_text and (meta_tokens is not None) and (self.meta_delta_mlp is not None):
@@ -337,12 +445,14 @@ class CustomCLIPSeg(nn.Module):
         if patch_tokens.shape[1] == gh_guess * gw_guess + 1:
             patch_tokens = patch_tokens[:, 1:, :]
 
-        # Reshape tokens -> feature map
-        gh, gw = _infer_grid_hw(patch_tokens.shape[1], H, W, patch=self.patch_size)
-        feat = patch_tokens.transpose(1, 2).contiguous().view(B, patch_tokens.shape[2], gh, gw)  # [B, D, gh, gw]
-
-        # Dense pixel embeddings at low-res grid
-        pix_emb = self.decoder(feat)  # [B, embed_dim, gh, gw]
+        if self._decoder_expects_tokens:
+            # Segmenter-style: pass tokens + original (H,W)
+            pix_emb = self.decoder(patch_tokens, (H, W))  # [B, D, gh, gw]
+        else:
+            # DeepLabV3-style: pass feature map
+            gh, gw = _infer_grid_hw(patch_tokens.shape[1], H, W, patch=self.patch_size)
+            feat = patch_tokens.transpose(1, 2).contiguous().view(B, patch_tokens.shape[2], gh, gw)
+            pix_emb = self.decoder(feat)  # [B, D, gh, gw]
 
         # Upsample to input resolution
         pix_emb = F.interpolate(pix_emb, size=(H, W), mode="bilinear", align_corners=False)
@@ -532,23 +642,31 @@ class HiCroPL_Seg(TrainerX):
 
         ignore_index = getattr(cfg.DATASET, "IGNORE_INDEX", 255)
 
-        tfm_train = build_seg_transform(cfg, is_train=True, ignore_index=int(ignore_index))
-        tfm_test = build_seg_transform(cfg, is_train=False, ignore_index=int(ignore_index))
+        # train transform (keep as-is)
+        tfm_train = build_seg_transform(cfg, is_train=True, ignore_index=ignore_index)
+
+        # ---- FIX: force val/test transform to have fixed output size
+        cfg_test = deepcopy(cfg)
+        cfg_test.defrost()
+        cfg_test.INPUT.TRANSFORMS = ["resize", "normalize"]  # fixed H,W
+        cfg_test.freeze()
+
+        tfm_test = build_seg_transform(cfg_test, is_train=False, ignore_index=ignore_index)
 
         # Dataset uses fixed structure: root/{split}/images and root/{split}/masks
-        train_set = LULCSegDataset(
-            root=root_dir,
+        train_set = build_seg_dataset_from_cfg(
+            cfg,
             split="train",
-            transforms=tfm_train,
-            mask_suffix=getattr(cfg.DATASET, "MASK_SUFFIX", "_gt"),
+            transform=tfm_train,
+            root_dir=root_dir,
             validate_labels=getattr(cfg.DATASET, "VALIDATE_LABELS", False),
         )
 
-        val_set = LULCSegDataset(
-            root=root_dir,
+        val_set = build_seg_dataset_from_cfg(
+            cfg,
             split="val",
-            transforms=tfm_test,
-            mask_suffix=getattr(cfg.DATASET, "MASK_SUFFIX", "_gt"),
+            transform=tfm_test,
+            root_dir=root_dir,
             validate_labels=False,
         )
 
@@ -596,7 +714,7 @@ class HiCroPL_Seg(TrainerX):
         self.model = CustomCLIPSeg(cfg, classnames, clip_model)
 
         print("Turning off gradients in the CLIP encoders; training prompts + decoder")
-        train_keys = ("prompt_learner", "decoder", "meta_delta")
+        train_keys = ("prompt_learner", "decoder", "meta_delta", "desc_delta")
         for name, param in self.model.named_parameters():
             param.requires_grad_(any(k in name for k in train_keys))
 
@@ -807,11 +925,12 @@ class HiCroPL_Seg(TrainerX):
         seg_cfg = getattr(self.cfg.TRAINER, "HICROPL_SEG", None)
 
         self.use_desc = bool(getattr(seg_cfg, "USE_DESC", False)) if seg_cfg is not None else False
+        self.use_desc_direct = bool(getattr(seg_cfg, "USE_DESC_DIRECT", False)) if seg_cfg is not None else False
         self.desc_w = float(getattr(seg_cfg, "DESC_W", 0.1)) if seg_cfg is not None else 0.1
         self.desc_bank_path = str(getattr(seg_cfg, "DESC_BANK", "data/bing_rgb/desc_emb_bank.pt")) if seg_cfg is not None else "data/bing_rgb/desc_emb_bank.pt"
 
         self.desc_bank = None
-        if not self.use_desc:
+        if not (self.use_desc or self.use_desc_direct):
             return
 
         if not osp.exists(self.desc_bank_path):
@@ -883,6 +1002,36 @@ class HiCroPL_Seg(TrainerX):
             if tok is None:
                 tok = self.meta_default_tok
             out[i].copy_(tok.view(-1).long())
+        return out.to(self.device, non_blocking=True)
+
+    def _get_desc_emb(self, batch) -> torch.Tensor:
+        """Return FloatTensor [B,D] on device (or None if disabled / unavailable)."""
+        if not (getattr(self, "use_desc", False) or getattr(self, "use_desc_direct", False)):
+            return None
+        if self.desc_bank is None:
+            return None
+
+        keys = batch.get("key", None)
+        if keys is None:
+            return None
+
+        # infer embedding dim from first entry
+        sample = next(iter(self.desc_bank.values()))
+        D = int(sample.numel())
+
+        B = len(keys)
+        out = torch.zeros((B, D), dtype=torch.float32)
+        found_any = False
+
+        for i, k in enumerate(keys):
+            te = self.desc_bank.get(k, None)
+            if te is not None:
+                out[i].copy_(te.view(-1).float())
+                found_any = True
+
+        if not found_any:
+            return None
+
         return out.to(self.device, non_blocking=True)
 
 
@@ -984,10 +1133,11 @@ class HiCroPL_Seg(TrainerX):
     @torch.no_grad()
     def _sliding_window_logits(
         self,
-        img: torch.Tensor,  # [1,3,H,W]
+        img: torch.Tensor,
         tile: int = 224,
         stride: int = 112,
-        meta_tokens: torch.Tensor = None,  # [1,77] LongTensor or None
+        meta_tokens: torch.Tensor = None,
+        desc_emb: torch.Tensor = None,
     ) -> torch.Tensor:
         """Run sliding-window inference and stitch logits back to [1,C,H,W]."""
         assert img.dim() == 4 and img.size(0) == 1, "Pass a single image [1,3,H,W]"
@@ -1028,9 +1178,9 @@ class HiCroPL_Seg(TrainerX):
 
                 if prec == "amp":
                     with autocast():
-                        logits_patch = self.model(patch, meta_tokens=meta_tokens)
+                        logits_patch = self.model(patch, meta_tokens=meta_tokens, desc_emb=desc_emb)
                 else:
-                    logits_patch = self.model(patch, meta_tokens=meta_tokens)
+                    logits_patch = self.model(patch, meta_tokens=meta_tokens, desc_emb=desc_emb)
 
                 logits_patch = logits_patch.float()
 
@@ -1050,6 +1200,7 @@ class HiCroPL_Seg(TrainerX):
         img, mask = self.parse_batch_train(batch_x)
 
         meta_tokens = self._get_meta_tokens(batch_x)
+        desc_emb = self._get_desc_emb(batch_x)
         prec = self.cfg.TRAINER.HICROPL.PREC
         ignore_index = int(getattr(self.cfg.DATASET, "IGNORE_INDEX", 255))
 
@@ -1067,9 +1218,18 @@ class HiCroPL_Seg(TrainerX):
         if prec == "amp":
             with autocast():
                 if getattr(self, "use_desc", False):
-                    logits, img_global = self.model(img, return_global=True, meta_tokens=meta_tokens)
+                    logits, img_global = self.model(
+                        img,
+                        return_global=True,
+                        meta_tokens=meta_tokens,
+                        desc_emb=desc_emb,
+                    )
                 else:
-                    logits = self.model(img, meta_tokens=meta_tokens)
+                    logits = self.model(
+                        img,
+                        meta_tokens=meta_tokens,
+                        desc_emb=desc_emb,
+                    )
 
             loss_seg, comps = self._compute_seg_loss(logits, mask, ignore_index)
             loss = loss_seg
@@ -1113,9 +1273,18 @@ class HiCroPL_Seg(TrainerX):
         else:
             # Forward
             if getattr(self, "use_desc", False):
-                logits, img_global = self.model(img, return_global=True)
+                logits, img_global = self.model(
+                    img,
+                    return_global=True,
+                    meta_tokens=meta_tokens,
+                    desc_emb=desc_emb,
+                )
             else:
-                logits = self.model(img)
+                logits = self.model(
+                    img,
+                    meta_tokens=meta_tokens,
+                    desc_emb=desc_emb,
+                )
 
             # Segmentation loss (unchanged)
             loss_seg, comps = self._compute_seg_loss(logits, mask, ignore_index)
@@ -1238,6 +1407,7 @@ class HiCroPL_Seg(TrainerX):
         for batch in loader:
             img, mask = self.parse_batch_test(batch)
             meta_tokens = self._get_meta_tokens(batch)
+            desc_emb = self._get_desc_emb(batch)
 
             tile = int(self.cfg.INPUT.SIZE[0])  # 224
             stride = tile // 2                 # 112
@@ -1248,17 +1418,24 @@ class HiCroPL_Seg(TrainerX):
             for i in range(B):
                 img_i = img[i:i+1]
                 meta_i = None if meta_tokens is None else meta_tokens[i:i+1]
+                desc_i = None if desc_emb is None else desc_emb[i:i+1]
 
                 # If test images are larger than tile, use sliding window
                 if img_i.size(-1) > tile or img_i.size(-2) > tile:
-                    logits_i = self._sliding_window_logits(img_i, tile=tile, stride=stride, meta_tokens=meta_i)
+                    logits_i = self._sliding_window_logits(
+                        img_i,
+                        tile=tile,
+                        stride=stride,
+                        meta_tokens=meta_i,
+                        desc_emb=desc_i,
+                    )
                 else:
                     prec = self.cfg.TRAINER.HICROPL.PREC
                     if prec == "amp":
                         with autocast():
-                            logits_i = self.model(img_i, meta_tokens=meta_i)
+                            logits_i = self.model(img_i, meta_tokens=meta_i, desc_emb=desc_i)
                     else:
-                        logits_i = self.model(img_i, meta_tokens=meta_i)
+                        logits_i = self.model(img_i, meta_tokens=meta_i, desc_emb=desc_i)
 
                     logits_i = logits_i.float()
 
@@ -1281,6 +1458,17 @@ class HiCroPL_Seg(TrainerX):
                 ignore_index=ignore_index
             )
 
+            if "fg_correct" not in locals():
+                fg_correct = 0
+                fg_total = 0
+
+            gt = mask.detach().cpu()
+            pd = pred.detach().cpu()
+
+            valid_fg = (gt != ignore_index) & (gt != 0)   # exclude ignore + background
+            fg_correct += int((pd[valid_fg] == gt[valid_fg]).sum().item())
+            fg_total += int(valid_fg.sum().item())
+
             # Safe loss: skip if this batch has 0 valid pixels
             valid = mask.ne(ignore_index)
             n_valid = int(valid.sum().item())
@@ -1301,6 +1489,15 @@ class HiCroPL_Seg(TrainerX):
 
         # Compute IoU
         miou, per_iou = _miou_from_cm(cm)
+        fg_pix_acc = fg_correct / (fg_total + 1e-12) if fg_total > 0 else 0.0
+
+        correct = cm.diag().sum().item()
+        total = cm.sum().item()
+        pix_acc = correct / (total + 1e-12)
+
+        # Mean class accuracy (optional)
+        per_acc = cm.diag().float() / cm.sum(dim=1).clamp_min(1).float()
+        macc = float(per_acc.mean().item())
 
         # Safe average loss
         avg_loss = (total_loss_sum / float(total_valid_px)) if total_valid_px > 0 else 0.0
@@ -1308,20 +1505,29 @@ class HiCroPL_Seg(TrainerX):
         # Logging (tensorboard)
         self.write_scalar(f"{split}/loss", float(avg_loss), self.epoch)
         self.write_scalar(f"{split}/mIoU", float(miou), self.epoch)
+        self.write_scalar(f"{split}/pixAcc", float(pix_acc), self.epoch)
+        self.write_scalar(f"{split}/mAcc", float(macc), self.epoch)  # optional
+        self.write_scalar(f"{split}/pixAcc_fg", float(fg_pix_acc), self.epoch)
         for i, cname in enumerate(self.classnames):
             self.write_scalar(f"{split}/IoU_{cname}", float(per_iou[i].item()), self.epoch)
 
         # Console prints
         print(f"[{split}] val_loss: {avg_loss:.4f} (valid_px={total_valid_px}, skipped_batches={skipped_batches}, nonfinite_batches={nonfinite_batches})")
         print(f"[{split}] mIoU: {miou:.4f}")
+        print(f"[{split}] pixAcc: {pix_acc:.4f} | mAcc: {macc:.4f}")
+        print(f"[{split}] pixAcc_fg(no-bg): {fg_pix_acc:.4f} (fg_px={fg_total})")
         for i, cname in enumerate(self.classnames):
             print(f"  - IoU[{i:02d}] {cname}: {float(per_iou[i].item()):.4f}")
+        
 
         # wandb logging (fixes the old IoU[i] bug by using per_iou)
         if wandb.run is not None:
             log_dict = {
                 f"{split}/loss": float(avg_loss),
                 f"{split}/mIoU": float(miou),
+                f"{split}/pixAcc": float(pix_acc),
+                f"{split}/mAcc": float(macc),
+                f"{split}/pixAcc_fg": float(fg_pix_acc),
                 "epoch": self.epoch + 1,
             }
             for i in range(num_classes):

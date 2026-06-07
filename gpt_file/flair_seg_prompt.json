@@ -1,0 +1,38 @@
+{
+  "building": [
+    "Buildings and similar constructions such as towers, agricultural silos, water towers, and dams."
+  ],
+  "pervious surface": [
+    "Human-made bare surfaces covered with permeable mineral materials, such as gravel paths, railways, quarries, landfills, construction sites, and coastal riprap."
+  ],
+  "impervious surface": [
+    "Human-made bare surfaces made of impermeable materials such as concrete, asphalt, or cobblestones, including roads, parking lots, and some sports fields."
+  ],
+  "bare soil": [
+    "Natural permanently bare ground that remains without vegetation throughout the year, often covered with sand, pebbles, rocks, or stones."
+  ],
+  "water": [
+    "Areas covered by water, such as seas, rivers, lakes, and ponds."
+  ],
+  "coniferous": [
+    "Areas with identifiable coniferous trees, such as pines, firs, cedars, or cypresses, taller than 5 meters."
+  ],
+  "deciduous": [
+    "Areas with identifiable deciduous trees, such as oaks, beeches, birches, chestnuts, or poplars, taller than 5 meters."
+  ],
+  "brushwood": [
+    "Natural woody vegetation lower than 5 meters, including shrubs, young trees, shrublands, mountain moors, and abandoned agricultural land."
+  ],
+  "vineyard": [
+    "Vineyard areas, treated as a separate class because of their distinct land-cover characteristics."
+  ],
+  "herbaceous vegetation": [
+    "Herbaceous surfaces not intensively used for agriculture, including lawns, parks, recreational grass fields, natural grassy areas, and uncultivated grass."
+  ],
+  "agricultural land": [
+    "Agricultural areas including major crops and permanent or temporary grasslands used for agriculture."
+  ],
+  "plowed land": [
+    "Agricultural land with no visible vegetation, such as recently plowed or freshly harvested fields."
+  ]
+}

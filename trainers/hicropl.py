@@ -38,6 +38,8 @@ CoPrompt_dataset_name_mapping = {
     "SUN397": "sun397",
     "UCF101": "ucf101",
     "LULCSegDataset": "lulc_seg",
+    "GIDSegDataset": "gid_seg",
+    "FLAIRSegDataset": "flair_seg",
 }
 
 def _get_clones(module, N):
