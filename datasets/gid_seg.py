@@ -164,7 +164,7 @@ class GIDSegDataset(Dataset):
         masks_dir: Optional[Union[str, Path]] = None,
         classnames: Sequence[str] = CLASSNAMES_GID_24,
         transforms: Optional[Callable[[Image.Image, Image.Image], Tuple[torch.Tensor, torch.Tensor]]] = None,
-        mask_suffix: str = "",
+        mask_suffix: str = "_5label",
         mask_ext: str = ".png",
         ignore_index: int = 255,
         # TIFF handling

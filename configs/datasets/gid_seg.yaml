@@ -16,7 +16,7 @@ DATASET:
   ]
 
   # Your masks are named like: <stem>_24label.png
-  MASK_SUFFIX: ""
+  MASK_SUFFIX: "_5label"
 
   IGNORE_INDEX: 255
   VALIDATE_LABELS: True

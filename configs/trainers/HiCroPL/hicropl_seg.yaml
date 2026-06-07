@@ -64,7 +64,7 @@ TRAINER:
   HICROPL:
     N_CTX: 16
     CROSS_LAYER: 6
-    CTX_INIT: "a photo of a"
+    CTX_INIT: ""
     PREC: "amp"           # "fp16" | "fp32" | "amp"
     PROMPT_DEPTH: 12
     TEACHER_NAME: "ViT-B/16"
@@ -86,9 +86,9 @@ TRAINER:
     CLASS_WEIGHTS: ()
 
     # USE_DESC: True
-    USE_DESC: False
+    USE_DESC: True
     DESC_W: 0.1
-    DESC_BANK: "gid/desc_emb_bank.pt"
+    DESC_BANK: "flair/desc_emb_bank.pt"
 
     USE_DESC_DIRECT: False      # NEW: make desc affect logits directly
     DESC_DIRECT_ALPHA: 1.0
@@ -106,7 +106,7 @@ TRAINER:
     META_TEXT_ALPHA: 1.0
     META_TEXT_HIDDEN: 256  
 
-    USE_CLASS_DESC: False
+    USE_CLASS_DESC: True
     # USE_CLASS_DESC: True
     CLASS_DESC_ALPHA: 2.0
 
